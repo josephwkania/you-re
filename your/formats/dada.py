@@ -99,12 +99,16 @@ class DadaManager:
         """
         return self.writer.markEndOfData()
 
-    def teardown(self):
+    def teardown(self, disconnect=True):
         """
         Disconnect the writer and tear down the buffers.
 
+        Args:
+            disconnect (bool): disconnect the writer first; False after a
+                reader has died, when disconnecting would wait on it for good
         """
-        self.writer.disconnect()
+        if disconnect:
+            self.writer.disconnect()
         subprocess.run(["dada_db", "-d", "-k", str(self.key)], check=True)
 
     def __enter__(self):

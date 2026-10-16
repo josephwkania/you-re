@@ -154,3 +154,13 @@ def test_required_command_failures_propagate(monkeypatch, operation):
             with pytest.raises(subprocess.CalledProcessError):
                 manager.teardown()
             assert manager.writer.disconnected
+
+
+def test_dada_teardown_after_a_reader_died_skips_the_disconnect(monkeypatch):
+    dada, fake_writer = _load_dada_module(monkeypatch)
+    calls = _capture_runs(dada, monkeypatch)
+    manager = dada.DadaManager(size=128, key="0x1234")
+    manager.writer = fake_writer()
+    manager.teardown(disconnect=False)
+    assert not manager.writer.disconnected
+    assert [call[0] for call in calls] == [["dada_db", "-d", "-k", "0x1234"]]

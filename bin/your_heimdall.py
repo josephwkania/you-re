@@ -7,7 +7,11 @@ import argparse
 import json
 import logging
 import os
+import signal
+import subprocess
+import sys
 import textwrap
+import time
 from datetime import datetime
 from multiprocessing import Process
 
@@ -18,6 +22,30 @@ from your import Your
 from your.utils.heimdall import HeimdallManager
 from your.utils.misc import MyEncoder, YourArgparseFormatter
 from your.writer import Writer
+
+
+def page_samples(gulp, most):
+    """
+    The largest whole divisor of the writer's `gulp` that is at most `most`
+    samples, so every page of the ring is full.
+    """
+    best = 1
+    for d in range(1, int(gulp**0.5) + 1):
+        if gulp % d == 0:
+            for c in (d, gulp // d):
+                if best < c <= most:
+                    best = c
+    return best
+
+
+def run_in_own_group(run):
+    """
+    Call `run` as the leader of a new process group, so that stopping the
+    group also stops any program it started, such as heimdall.
+    """
+    os.setpgrp()
+    run()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -163,6 +191,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_log_file", help="Do not write a log file", action="store_true"
     )
+    parser.add_argument(
+        "--make_candidates",
+        help="Also run your_candmaker.py on the ring as a second reader, making "
+        "h5 candidates from memory as Heimdall reports them",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--candmaker_args",
+        help="Extra arguments for your_candmaker.py, e.g. '-n 4 -g 0 --snr_min 7'",
+        type=str,
+        default="",
+    )
     values = parser.parse_args()
 
     if values.output_dir is None:
@@ -240,7 +280,15 @@ if __name__ == "__main__":
         savgol_frequency_window=values.savgol_frequency_window,
         flag_rfi=values.flag_rfi,
     )
-    your_dada_writer.setup_dada()  # need to run the set up inorder to get the dada key
+    if values.make_candidates:
+        # pages a quarter of Heimdall's gulp, so the writer can run at most
+        # the ring's 8 pages, two gulps, ahead of Heimdall, and the
+        # candmaker's history need only cover three gulps past the delay
+        data_step = page_samples(your_dada_writer.gulp, nsamps_gulp // 4)
+        your_dada_writer.setup_dada(data_step=data_step, n_readers=2)
+    else:
+        # need to run the set up inorder to get the dada key
+        your_dada_writer.setup_dada()
 
     if values.mask:
         logging.info("Reading RFI mask from %s", values.mask)
@@ -291,17 +339,72 @@ if __name__ == "__main__":
         json.dump(HM.__dict__, fp, cls=MyEncoder, indent=4)
 
     dada_process = Process(name="To dada", target=your_dada_writer.to_dada)
-    heimdall_process = Process(name="Heimdall", target=HM.run)
+    heimdall_process = Process(name="Heimdall", target=run_in_own_group, args=(HM.run,))
+
+    candmaker = None
+    if values.make_candidates:
+        latency = 3 * nsamps_gulp * your_object.your_header.tsamp + 30
+        candmaker_cmd = [
+            sys.executable,
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "your_candmaker.py"
+            ),
+            "--dada_key",
+            str(your_dada_writer.dada_key),
+            "--cand_dir",
+            values.output_dir,
+            "--max_dm",
+            str(float(np.max(values.dm))),
+            "--latency",
+            str(latency),
+            "--heimdall_gulp",
+            str(nsamps_gulp),
+            "--max_boxcar",
+            str(int(np.ceil(np.log2(max(HM.boxcar_max, 1))))),
+            "-o",
+            values.output_dir,
+            *values.candmaker_args.split(),
+        ]
+        logging.info("Starting the candmaker: %s", " ".join(candmaker_cmd))
+        candmaker = subprocess.Popen(candmaker_cmd)
 
     dada_process.start()
     heimdall_process.start()
 
+    stopped = False
     try:
+        # the writer waits for every reader, so a reader that dies (Heimdall
+        # or the candmaker) would stall the others; stop everything if one does
+        while heimdall_process.is_alive() or dada_process.is_alive():
+            if candmaker is not None and candmaker.poll() not in (None, 0):
+                raise RuntimeError(
+                    f"your_candmaker.py exited with {candmaker.returncode}"
+                )
+            for process in (heimdall_process, dada_process):
+                if process.exitcode not in (None, 0):
+                    raise RuntimeError(f"{process.name} exited with {process.exitcode}")
+            time.sleep(1)
         heimdall_process.join()
         dada_process.join()
-    except KeyboardInterrupt:
+        if candmaker is not None:
+            candmaker.wait()
+    except (KeyboardInterrupt, RuntimeError) as error:
+        logging.error("Stopping: %r", error)
+        stopped = True
+        # heimdall itself as well as the process that started it
+        try:
+            os.killpg(heimdall_process.pid, signal.SIGTERM)
+        except (ProcessLookupError, TypeError):
+            pass
         heimdall_process.terminate()
         dada_process.terminate()
+        if candmaker is not None:
+            candmaker.terminate()
+        heimdall_process.join()
+        dada_process.join()
 
-    your_dada_writer.DM.teardown()
+    # disconnecting waits on the readers, which may be gone after a stop
+    your_dada_writer.DM.teardown(disconnect=not stopped)
     logging.info("Destroyed dada buffers")
+    if stopped:
+        raise SystemExit(1)
