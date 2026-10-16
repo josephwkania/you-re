@@ -22,10 +22,8 @@ from multiprocessing.util import Finalize
 
 import numpy as np
 import pandas as pd
-from numba import config as numba_config
-from numba import set_num_threads
 
-from your.candidate import Candidate, crop
+from your.candidate import Candidate, crop, set_median_threads
 from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop
 from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
@@ -212,8 +210,8 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         args,
         gpu_id,
     ) = cand_val
-    # the median's numba threads, an equal share of the cores per worker
-    set_num_threads(min(worker_threads(args.nproc), numba_config.NUMBA_NUM_THREADS))
+    # the median's threads, an equal share of the cores per worker
+    set_median_threads(worker_threads(args.nproc))
     if os.path.exists(str(kill_mask_path)):
         logger.info(f"Using mask {kill_mask_path}")
         kill_chans = np.loadtxt(kill_mask_path, dtype=np.int32)

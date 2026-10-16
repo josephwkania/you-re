@@ -2,6 +2,7 @@
 
 mod crop;
 mod kernels;
+mod median;
 mod resize;
 
 use kernels::{
@@ -536,8 +537,42 @@ fn gaussian_decimate<'py>(
         .map(|out| out.into_pyarray(py))
 }
 
+/// `(nchans, 256)` int64 counts of each 8-bit value in each channel of
+/// C-contiguous `(nsamples, nchans)` uint8 data, `threads` bands of 256
+/// channels at a time.
+#[pyfunction(signature = (data, threads=1))]
+fn channel_histogram<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, u8>,
+    threads: usize,
+) -> PyResult<Bound<'py, PyArray2<i64>>> {
+    let (nt, nf) = (data.shape()[0], data.shape()[1]);
+    // the per-thread tables count in 32 bits
+    if nt > u32::MAX as usize {
+        return Err(PyValueError::new_err(
+            "too many samples to count in 32 bits",
+        ));
+    }
+    let values = data
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("data must be C-contiguous"))?;
+    let total = nf
+        .checked_mul(256)
+        .ok_or_else(|| PyMemoryError::new_err("histogram is too large"))?;
+    let mut counts = Vec::new();
+    counts
+        .try_reserve_exact(total)
+        .map_err(|_| PyMemoryError::new_err("histogram is too large"))?;
+    counts.resize(total, 0_i64);
+    py.detach(|| median::channel_histogram(values, nt, nf, threads, &mut counts));
+    Array2::from_shape_vec((nf, 256), counts)
+        .map_err(|_| PyMemoryError::new_err("histogram is too large"))
+        .map(|counts| counts.into_pyarray(py))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(channel_histogram, module)?)?;
     module.add_function(wrap_pyfunction!(crop_planes, module)?)?;
     module.add_function(wrap_pyfunction!(dedisperse, module)?)?;
     module.add_function(wrap_pyfunction!(dedispersets, module)?)?;

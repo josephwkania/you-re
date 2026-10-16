@@ -5,10 +5,10 @@ from operator import index
 
 import h5py
 import numpy as np
-from numba import njit, prange
 from scipy.optimize import golden
 
 from your import Your
+from your._rust import channel_histogram as _rust_channel_histogram
 from your._rust import crop_planes as _rust_crop_planes
 from your._rust import dedisperse as _rust_dedisperse
 from your._rust import dedispersets as _rust_dedispersets
@@ -66,25 +66,20 @@ def crop_window(nsamples, decimate_factor, time_size):
     return col0, kept
 
 
-@njit(parallel=True, cache=True)
-def _channel_histogram(data, counts):
+# threads counting the 8-bit median; all cores until set_median_threads
+_median_threads = None
+
+
+def set_median_threads(threads):
     """
-    Count each 8-bit value in each channel: `counts[ch, v]` is how many
-    samples of channel `ch` are `v`. Threads take a band of 256 channels
-    each, reading whole cache lines of the chunk, and count into a private
-    32-bit table small enough to stay in cache before storing it.
+    Threads `channel_median` counts with, such as a candmaker worker's share
+    of the cores; None for all of them.
+
+    Args:
+        threads (int): threads, or None
     """
-    nsamples, nchans = data.shape
-    for band in prange((nchans + 255) // 256):
-        c0 = band * 256
-        c1 = min(c0 + 256, nchans)
-        local = np.zeros((c1 - c0, 256), dtype=np.uint32)
-        for s in range(nsamples):
-            for ch in range(c0, c1):
-                local[ch - c0, data[s, ch]] += 1
-        for ch in range(c0, c1):
-            for v in range(256):
-                counts[ch, v] = local[ch - c0, v]
+    global _median_threads
+    _median_threads = threads
 
 
 def channel_median(data):
@@ -99,11 +94,18 @@ def channel_median(data):
     Returns:
         numpy.ndarray: (nchans,) float64 median of each channel
     """
-    if data.dtype != np.uint8 or data.ndim != 2 or data.shape[0] == 0:
+    if (
+        data.dtype != np.uint8
+        or data.ndim != 2
+        # the counts are 32-bit
+        or not 0 < data.shape[0] <= np.iinfo(np.uint32).max
+    ):
         return np.median(data, axis=0)
-    nsamples, nchans = data.shape
-    counts = np.zeros((nchans, 256), dtype=np.int64)
-    _channel_histogram(data, counts)
+    nsamples = data.shape[0]
+    # bands of 256 channels per thread, each counted into a private table
+    counts = _rust_channel_histogram(
+        np.ascontiguousarray(data), _median_threads or os.cpu_count() or 1
+    )
     below = np.cumsum(counts, axis=1)
 
     def order_statistic(k):

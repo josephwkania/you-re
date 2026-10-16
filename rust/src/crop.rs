@@ -172,7 +172,7 @@ fn channel_major<T: Sample>(data: &[T], nt: usize, nf: usize, threads: usize) ->
 }
 
 /// Run `work` on every item, the items split between up to `threads` threads.
-fn run_split<I: Send, F: Fn(I) + Sync>(items: Vec<I>, threads: usize, work: F) {
+pub(crate) fn run_split<I: Send, F: Fn(I) + Sync>(items: Vec<I>, threads: usize, work: F) {
     let threads = threads.max(1).min(items.len().max(1));
     if threads == 1 {
         items.into_iter().for_each(&work);

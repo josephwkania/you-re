@@ -3,7 +3,12 @@ import os
 import numpy as np
 import pytest
 
-from your.candidate import Candidate, channel_median, pad_with_median
+from your.candidate import (
+    Candidate,
+    channel_median,
+    pad_with_median,
+    set_median_threads,
+)
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 _install_dir = os.path.abspath(os.path.dirname(__file__))
@@ -248,6 +253,17 @@ def test_channel_median_matches_numpy(nsamples, nchans):
     np.testing.assert_array_equal(
         channel_median(data[::2, ::-1]), np.median(data[::2, ::-1], axis=0)
     )
+
+
+@pytest.mark.parametrize("threads", [1, 2, 5])
+def test_channel_median_any_threads(threads):
+    rng = np.random.default_rng(threads)
+    data = rng.integers(0, 256, (1001, 1300), dtype=np.uint8)
+    set_median_threads(threads)
+    try:
+        np.testing.assert_array_equal(channel_median(data), np.median(data, axis=0))
+    finally:
+        set_median_threads(None)
 
 
 @pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32])

@@ -313,6 +313,36 @@ def crop_checks(module):
             raise AssertionError(f"crop_planes accepted {bad}")
 
 
+def median_checks(module):
+    """The 8-bit median counts as np.median takes it, on any thread count."""
+    rng = np.random.default_rng(20261016)
+    native = module._rust_channel_histogram
+    for nt, nf in ((1, 1), (2, 3), (255, 256), (1000, 600), (4097, 257)):
+        base = rng.integers(0, 256, (nt, nf), dtype=np.uint8)
+        counts = np.zeros((nf, 256), dtype=np.int64)
+        np.add.at(counts, (np.broadcast_to(np.arange(nf), base.shape), base), 1)
+        for threads in (1, 3, 64):
+            same(native(base, threads), counts)
+            module.set_median_threads(threads)
+            for data in (base, base[::2, ::-1], np.asfortranarray(base)):
+                if data.shape[0]:
+                    same(module.channel_median(data), np.median(data, axis=0))
+    module.set_median_threads(None)
+    for bad in (np.zeros((4, 4), np.uint16), np.zeros(4, np.uint8)):
+        try:
+            native(bad, 1)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"channel_histogram accepted {bad.dtype} {bad.shape}")
+    try:
+        native(np.zeros((4, 4), np.uint8)[:, ::2], 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("channel_histogram accepted strided data")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--missing-rust", action="store_true")
@@ -340,7 +370,14 @@ def main():
 
     from your import _rust
 
-    for name in ("crop_planes", "dedisperse", "dedispersets", "dmtime", "rfi_stats"):
+    for name in (
+        "channel_histogram",
+        "crop_planes",
+        "dedisperse",
+        "dedispersets",
+        "dmtime",
+        "rfi_stats",
+    ):
         assert callable(getattr(_rust, name))
     direct_checks(_rust)
     import your.candidate as module
@@ -348,6 +385,7 @@ def main():
 
     public_checks(module, rfi)
     crop_checks(module)
+    median_checks(module)
     print("PASS: native kernels and NumPy compatibility paths")
 
 
