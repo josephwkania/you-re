@@ -31,7 +31,12 @@ setup(
             args=["--locked"],
         )
     ],
-    extras_require={"test": ["pytest", "pytest-cov"]},
+    extras_require={
+        "test": ["pytest", "pytest-cov"],
+        # the GPU candmaker, with the CUDA headers CuPy compiles its kernels
+        # against; or install the cupy package for your CUDA version
+        "gpu": ["cupy-cuda12x[ctk]>=13"],
+    },
     install_requires=required,
     long_description=long_description,
     long_description_content_type="text/markdown",

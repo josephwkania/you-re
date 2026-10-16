@@ -66,6 +66,12 @@ pip install -r requirements.txt
 python -m pip install .
 ``` 
 
+The GPU candmaker (`your_candmaker.py -g`) needs [CuPy](https://cupy.dev); install it with the
+`gpu` extra, or install the `cupy` package matching your CUDA version instead:
+```bash
+pip install 'your[gpu]'
+```
+
 **Note**:
     To use the `psrdada` format, you would need to install [psrdada-python](https://github.com/TRASAL/psrdada-python). [`your_heimdall.py`](https://thepetabyteproject.github.io/your/bin/your_heimdall/) requires [Heimdall](https://sourceforge.net/projects/heimdall-astro/) and [psrdada-python](https://github.com/TRASAL/psrdada-python). 
 
@@ -79,7 +85,8 @@ uv pip install -e '.[test]'
 MPLBACKEND=Agg uv run --no-project python -m pytest
 ```
 
-GPU tests are skipped automatically when CUDA is unavailable.
+GPU tests are skipped automatically when CuPy or a CUDA device is unavailable;
+install `'.[test,gpu]'` to run them.
 
 ## Candidate plots
 

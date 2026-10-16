@@ -30,7 +30,7 @@ If applicable, add screenshots to help explain your problem.
 - h5py 
 - scikit-image 
 - scipy 
-- numba
+- cupy (GPU only)
 - astropy
 - pandas
 - rich
