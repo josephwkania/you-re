@@ -73,9 +73,10 @@ def test_setup_dada_preserves_an_explicit_key(your_object, monkeypatch):
     created = []
 
     class FakeDadaManager:
-        def __init__(self, size, key):
+        def __init__(self, size, key, n_readers=1):
             self.size = size
             self.key = key
+            self.n_readers = n_readers
             self.setup_called = False
             created.append(self)
 
@@ -95,7 +96,12 @@ def test_setup_dada_preserves_an_explicit_key(your_object, monkeypatch):
     assert writer.dada_size == 2 * writer.nchans * np.dtype("uint8").itemsize
     assert writer.dada_is_set
     assert created[0].key == "0x1234"
+    assert created[0].n_readers == 1
     assert created[0].setup_called
+
+    writer = Writer(your_object, gulp=4, progress=False)
+    writer.setup_dada(dada_key="0x1235", data_step=2, n_readers=2)
+    assert created[1].n_readers == 2
 
 
 def test_to_dada_marks_eod_on_the_last_full_page(your_object, monkeypatch):

@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -310,3 +312,28 @@ def test_pinned_read_buffer_serves_every_gpu():
         cand = gpu_dedisp_and_dmt_crop(cand, device=device)
         assert np.array_equal(cand.dedispersed, ft)
         assert np.array_equal(cand.dmt, dmt)
+
+
+def test_check_compiler_explains_a_missing_nvrtc(monkeypatch):
+    def missing():
+        raise OSError("libnvrtc.so.12: cannot open shared object file")
+
+    fake = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(nvrtc=types.SimpleNamespace(getVersion=missing))
+    )
+    monkeypatch.setattr(gpu, "_cupy", lambda: fake)
+    with pytest.raises(RuntimeError, match="NVRTC"):
+        gpu.check_compiler()
+
+
+def test_release_memory_needs_no_cupy(monkeypatch):
+    monkeypatch.delitem(sys.modules, "cupy", raising=False)
+    gpu.release_memory()
+    assert "cupy" not in sys.modules
+
+    freed = []
+    pool = types.SimpleNamespace(free_all_blocks=lambda: freed.append(True))
+    fake = types.SimpleNamespace(get_default_memory_pool=lambda: pool)
+    monkeypatch.setitem(sys.modules, "cupy", fake)
+    gpu.release_memory()
+    assert freed == [True]

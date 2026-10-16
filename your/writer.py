@@ -386,6 +386,7 @@ class Writer:
 
         """
         header = dict()
+        header["HDR_VERSION"] = "1.0"
         header["BW"] = str(self.nchans * self.foff)
         header["FREQ"] = str((self.chan_freqs[0] + self.chan_freqs[-1]) / 2)
         tstart = Time(self.tstart, format="mjd")
@@ -398,16 +399,41 @@ class Writer:
         header["NCHAN"] = str(self.nchans)
         header["OBS_OFFSET"] = str(0)
         header["NPOL"] = str(1)
+        header["NDIM"] = str(1)
+        header["STATE"] = "Intensity"
         header["UTC_START"] = str(tstart.utc.iso.replace(" ", "-"))
+        header["SOURCE"] = str(self.your_object.your_header.source_name)
+        ra, dec = (
+            self.your_object.your_header.ra_deg,
+            self.your_object.your_header.dec_deg,
+        )
+        if ra is not None and dec is not None:
+            from astropy.coordinates import Angle
+
+            header["RA"] = Angle(ra, unit="deg").to_string(
+                unit="hourangle", sep=":", precision=4
+            )
+            header["DEC"] = Angle(dec, unit="deg").to_string(
+                unit="deg", sep=":", precision=3, alwayssign=True
+            )
+        # the exact values, which TSAMP in µs and FREQ/BW do not round-trip,
+        # for readers such as your.formats.dadastream that can use them
+        header["YOUR_FCH1"] = repr(float(self.chan_freqs[0]))
+        header["YOUR_FOFF"] = repr(float(self.foff))
+        header["YOUR_TSAMP"] = repr(float(self.your_object.your_header.tsamp))
+        if ra is not None and dec is not None:
+            header["YOUR_RA_DEG"] = repr(float(ra))
+            header["YOUR_DEC_DEG"] = repr(float(dec))
         return header
 
-    def setup_dada(self, dada_key=None, data_step=None):
+    def setup_dada(self, dada_key=None, data_step=None, n_readers=1):
         """
         Set up the psrdada buffers.
 
         Args:
             dada_key (hex): hex key, if left None, key would be chosen randomly
-            data_step (int): size of each page in the ring buffer in bytes
+            data_step (int): samples in each page of the ring buffer
+            n_readers (int): readers the ring waits for before reusing a page
 
         """
         from your.formats.dada import DadaManager
@@ -429,7 +455,9 @@ class Writer:
         logger.debug(
             f"Setting up DadaManager with key: {self.dada_key} and page size {self.dada_size} bytes"
         )
-        self.DM = DadaManager(size=self.dada_size, key=self.dada_key)
+        self.DM = DadaManager(
+            size=self.dada_size, key=self.dada_key, n_readers=n_readers
+        )
         self.DM.setup()
 
         self.dada_is_set = True

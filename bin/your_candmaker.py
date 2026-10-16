@@ -16,6 +16,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import textwrap
+import time
 from datetime import datetime
 from multiprocessing import Pool
 from multiprocessing.util import Finalize
@@ -24,7 +25,14 @@ import numpy as np
 import pandas as pd
 
 from your.candidate import Candidate, crop, set_median_threads
-from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop, gpu_errors
+from your.formats.dadastream import Overwritten, wait_for_chunk
+from your.utils.gpu import (
+    PinnedReadBuffer,
+    check_compiler,
+    gpu_dedisp_and_dmt_crop,
+    gpu_errors,
+    release_memory,
+)
 from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
 logger = logging.getLogger()
@@ -257,6 +265,9 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         if _cpu_read_buffer is None:
             _cpu_read_buffer = ReadBuffer()
         cand.read_buffer = _cpu_read_buffer
+    if cand.format == "dada":
+        # live: wait until the ring has delivered the chunk
+        wait_for_chunk(cand)
     cand.get_chunk(for_preprocessing=True)
     if cand.format == "fil":
         cand.fp.close()
@@ -272,6 +283,13 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
                 f"Ran into a CUDA error ({error}), using the CPU version for this "
                 "candidate"
             )
+            gpu_failed = True
+        else:
+            gpu_failed = False
+        if gpu_failed:
+            # the failed attempt's arrays are free only now the exception is
+            # gone; hand their memory back before the CPU takes over
+            release_memory()
             cand = cpu_dedisp_dmt(cand, args)
     else:
         cand = cpu_dedisp_dmt(cand, args)
@@ -293,7 +311,7 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         del cand
     else:
         cand.data = cand.dedispersed = cand.dmt = None
-    return None
+    return fout
 
 
 def cached_cand2h5(cand_val):
@@ -314,6 +332,152 @@ def cached_cand2h5(cand_val):
     except BaseException:
         _clear_worker_candidate()
         raise
+
+
+# the history live workers read candidates from, made before they fork
+_live_history = None
+
+
+def live_cand2h5(cand_val):
+    """
+    Make one candidate from the live history.
+
+    Returns:
+        tuple: (status, h5 file or reason, seconds taken), status being
+        "made", "lost" (its data had left the history) or "failed"
+    """
+    start = time.time()
+    try:
+        fout = _cand2h5(cand_val, files=_live_history)
+    except Overwritten as error:
+        logger.warning(f"Lost candidate at {cand_val[5]} s, DM {cand_val[3]}: {error}")
+        result = "lost", str(error)
+    except Exception as error:
+        # one bad candidate must not stop a live run
+        logger.exception(f"Failed candidate at {cand_val[5]} s, DM {cand_val[3]}")
+        result = "failed", repr(error)
+    else:
+        return "made", fout, time.time() - start
+    # a candidate that failed on the GPU leaves its memory in CuPy's pool,
+    # which Heimdall, on the same GPU, may need
+    release_memory()
+    return *result, time.time() - start
+
+
+def live_cuts(cands, values):
+    """
+    The Heimdall candidates worth making.
+
+    Args:
+        cands (pandas.DataFrame): from `CandWatcher.poll`
+        values: parsed arguments
+
+    Returns:
+        pandas.DataFrame: candidates passing every cut
+    """
+    keep = (
+        (cands.snr >= values.snr_min)
+        & (cands.dm >= values.dm_min)
+        & (cands.dm <= values.max_dm)
+        & (cands.members >= values.min_members)
+    )
+    if values.max_boxcar is not None:
+        keep &= cands.boxcar <= values.max_boxcar
+    return cands[keep]
+
+
+def live_main(values):
+    """
+    Make candidates from a psrdada ring as Heimdall reports them: read the
+    ring into a rolling history, watch Heimdall's .cand files, and make each
+    candidate passing the cuts from the history.
+    """
+    global _live_history
+    import multiprocessing
+    from itertools import cycle
+
+    from your.formats.dadastream import DadaHistory
+    from your.utils.heimdall import CandWatcher
+
+    _live_history = DadaHistory.connect(
+        values.dada_key, max_dm=values.max_dm, latency=values.latency
+    )
+    gpu_ids = cycle(values.gpu_id)
+    kill_mask_path = values.kill_mask or ""
+    # one candidate kept only to work out each candidate's samples
+    probe = Candidate(_live_history, dm=1.0)
+    # the most samples before its time any candidate can need: Heimdall's
+    # unreported gulps hold candidates from their first sample less this
+    tsamp = _live_history.params["tsamp"]
+    widest = 2 ** (values.max_boxcar if values.max_boxcar is not None else 12)
+    tfar = 4 * _live_history.capacity * tsamp
+    probe._reset_candidate(dm=values.max_dm, tcand=tfar, width=widest)
+    reach = int(tfar / tsamp) - probe.chunk_bounds()[0] + 1
+    watcher = CandWatcher(values.cand_dir, settle=values.settle)
+    jobs = []
+    counts = {"cut": 0, "made": 0, "lost": 0, "failed": 0}
+    # fork, so the workers share the history's memory; the reader thread
+    # starts after, in this process only
+    context = multiprocessing.get_context("fork")
+    with context.Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
+        _live_history.start(hold_timeout=values.hold_timeout)
+        ending = None
+        while True:
+            cands = watcher.poll()
+            kept = live_cuts(cands, values)
+            counts["cut"] += len(cands) - len(kept)
+            for row in kept.itertuples():
+                probe._reset_candidate(
+                    dm=row.dm, tcand=row.tcand, width=2**row.boxcar, snr=row.snr
+                )
+                first, nsamp = probe.chunk_bounds()
+                cand_val = [
+                    _live_history.name,
+                    row.snr,
+                    2**row.boxcar,
+                    row.dm,
+                    -1,
+                    row.tcand,
+                    kill_mask_path,
+                    1,
+                    values,
+                    next(gpu_ids),
+                ]
+                job = pool.apply_async(live_cand2h5, (cand_val,))
+                jobs.append(job)
+                if not values.drop_when_behind:
+                    # hold the ring for it once its data are in
+                    _live_history.pending[id(job)] = (max(0, first), first + nsamp)
+            if not values.drop_when_behind:
+                # Heimdall writes one .cand file per gulp, in order: keep what
+                # the candidates of gulps not yet reported may need. Raised
+                # only now, once the reported gulps' candidates are pending,
+                # so their data cannot slip away in between.
+                reported = len(watcher.done) * values.heimdall_gulp
+                _live_history.hold_from = reported - reach
+            for job in jobs:
+                if id(job) in _live_history.pending and job.ready():
+                    del _live_history.pending[id(job)]
+            if _live_history.eod:
+                # Heimdall's last files land after the data end; stop once
+                # nothing new has settled for a while
+                if not len(cands):
+                    ending = ending or time.time()
+                    if time.time() - ending > values.end_wait:
+                        break
+                else:
+                    ending = None
+            time.sleep(values.poll)
+        for job in jobs:
+            status, _, _ = job.get()
+            counts[status] += 1
+    logging.info(
+        f"Live candmaker done: {counts['made']} made, {counts['lost']} lost, "
+        f"{counts['failed']} failed, {counts['cut']} cut, from "
+        f"{_live_history.written} samples; held the ring "
+        f"{_live_history.held_seconds:.1f} s"
+    )
+    return counts
 
 
 if __name__ == "__main__":
@@ -361,9 +525,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c",
         "--cand_param_file",
-        help="csv file with candidate parameters",
+        help="csv file with candidate parameters (or use --dada_key)",
         type=str,
-        required=True,
+        required=False,
     )
     parser.add_argument(
         "-n",
@@ -427,7 +591,83 @@ if __name__ == "__main__":
         "did, for bit-identical output, instead of summing it exactly (slower)",
         action="store_true",
     )
+    live = parser.add_argument_group(
+        "live mode",
+        "Make candidates from a psrdada ring buffer as Heimdall reports them, "
+        "instead of from -c. The candmaker must attach to the ring before its "
+        "data start: make the ring with one reader more than Heimdall "
+        "(dada_db -r 2), or use your_heimdall.py --make_candidates.",
+    )
+    live.add_argument("--dada_key", help="hex key of the ring, e.g. dada", type=str)
+    live.add_argument("--cand_dir", help="directory Heimdall writes .cand files to")
+    live.add_argument(
+        "--max_dm",
+        help="highest DM to make; sets how much of the ring is kept",
+        type=float,
+    )
+    live.add_argument(
+        "--latency",
+        help="seconds Heimdall may take to report a candidate after its data "
+        "arrive: at least its gulp plus processing time",
+        type=float,
+        default=120.0,
+    )
+    live.add_argument("--snr_min", help="lowest S/N to make", type=float, default=6.0)
+    live.add_argument("--dm_min", help="lowest DM to make", type=float, default=0.0)
+    live.add_argument(
+        "--max_boxcar",
+        help="largest Heimdall boxcar (log2 of the width in samples) to make",
+        type=int,
+        default=None,
+    )
+    live.add_argument(
+        "--min_members", help="fewest cluster members to make", type=int, default=1
+    )
+    live.add_argument("--kill_mask", help="channel mask file for every candidate")
+    live.add_argument(
+        "--settle",
+        help="seconds a .cand file must be unchanged before it is read",
+        type=float,
+        default=1.0,
+    )
+    live.add_argument(
+        "--end_wait",
+        help="seconds to keep watching for .cand files after the data end",
+        type=float,
+        default=30.0,
+    )
+    live.add_argument(
+        "--poll", help="seconds between looks for .cand files", type=float, default=0.5
+    )
+    live.add_argument(
+        "--heimdall_gulp",
+        help="Heimdall's -nsamps_gulp; with one .cand file per gulp it tells "
+        "how far Heimdall has got",
+        type=int,
+        default=262144,
+    )
+    live.add_argument(
+        "--hold_timeout",
+        help="seconds to hold the ring for one page before giving up on the "
+        "candidates that need it",
+        type=float,
+        default=300.0,
+    )
+    live.add_argument(
+        "--drop_when_behind",
+        help="Never hold the ring for candidates not yet made: lose them "
+        "instead. By default the ring waits for Heimdall to report and for "
+        "queued candidates, which holds its writer; use this where the writer "
+        "must not wait, as with a live capture that would drop data.",
+        action="store_true",
+    )
     values = parser.parse_args()
+    if (values.cand_param_file is None) == (values.dada_key is None):
+        parser.error("give exactly one of -c/--cand_param_file and --dada_key")
+    if values.dada_key is not None and (
+        values.cand_dir is None or values.max_dm is None
+    ):
+        parser.error("--dada_key needs --cand_dir and --max_dm")
 
     logging_format = (
         "%(asctime)s - %(funcName)s -%(name)s - %(levelname)s - %(message)s"
@@ -468,6 +708,9 @@ if __name__ == "__main__":
         logging.info("%s: %r", arg, value)
 
     if -1 not in values.gpu_id:
+        # every candidate would fail without the kernel compiler; say so once,
+        # before any worker forks
+        check_compiler()
         for gpu_ids in values.gpu_id:
             logger.info(f"Using the GPU {gpu_ids}")
         if len(values.gpu_id) > 1:
@@ -476,6 +719,10 @@ if __name__ == "__main__":
             gpu_id_cycler = cycle(range(len(values.gpu_id)))
     else:
         logger.info("Using CPUs only")
+
+    if values.dada_key is not None:
+        live_main(values)
+        raise SystemExit(0)
 
     cand_pars = pd.read_csv(values.cand_param_file)
     # Randomly shuffle the candidates, this is so that the high DM candidates are spread through out

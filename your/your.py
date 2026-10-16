@@ -5,13 +5,14 @@ import os
 
 import numpy as np
 
+from your.formats.dadastream import DadaFile, DadaHistory
 from your.formats.psrfits import PsrfitsFile
 from your.formats.pysigproc import SigprocFile
 from your.utils.misc import MyEncoder, check_file_exist
 
 logger = logging.getLogger(__name__)
 
-FORMATS = {"fil": SigprocFile, "fits": PsrfitsFile}
+FORMATS = {"fil": SigprocFile, "fits": PsrfitsFile, "dada": DadaFile}
 
 
 class Your(PsrfitsFile, SigprocFile):
@@ -19,7 +20,8 @@ class Your(PsrfitsFile, SigprocFile):
     Your class.
 
     Args:
-        file: String or a list of files. It can either filterbank or psrfits files.
+        file: String or a list of files. It can either filterbank or psrfits files,
+            or a `your.formats.dadastream.DadaHistory` of a psrdada ring.
 
     Examples:
         your_object = your.Your("/path/to/filterbank.fil")
@@ -40,7 +42,9 @@ class Your(PsrfitsFile, SigprocFile):
 
     def __init__(self, file):
         self.your_file = file
-        if isinstance(self.your_file, str):
+        if isinstance(self.your_file, DadaHistory):
+            self.format = "dada"
+        elif isinstance(self.your_file, str):
             ext = os.path.splitext(self.your_file)[1]
             check_file_exist(self.your_file)
             if ext == ".fits" or ext == ".sf":
@@ -394,7 +398,10 @@ class Header:
     """
 
     def __init__(self, your):
-        if isinstance(your.your_file, str):
+        if your.format == "dada":
+            self.filelist = [your.your_file.name]
+            self.filename = your.your_file.name
+        elif isinstance(your.your_file, str):
             self.filelist = [your.your_file]
             self.filename = your.your_file
         elif isinstance(your.your_file, list):

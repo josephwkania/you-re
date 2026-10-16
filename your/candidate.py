@@ -373,16 +373,19 @@ class Candidate(Your):
             / 1000
         )
 
-    def get_chunk(self, tstart=None, tstop=None, for_preprocessing=True):
+    def chunk_bounds(self, tstart=None, tstop=None, for_preprocessing=True):
         """
-        Get a chunk of data. The data is saved in `self.data`.
+        The samples `get_chunk` reads, before any padding: its first sample
+        (negative when the chunk starts before the data) and how many.
 
         Args:
             tstart (float): start time of the chunk in seconds
             tstop (float): stop time of the chunk in seconds
-            for_preprocessing (bool): if the data is to be preprocessed later. This will modify the number of samples
-            read based on the width of the candidate
+            for_preprocessing (bool): widen the chunk as `get_chunk` does for
+                preprocessing
 
+        Returns:
+            tuple: (nstart_read, nsamp_read)
         """
         if tstart is None:
             tstart = (
@@ -415,6 +418,22 @@ class Candidate(Your):
             f"nstart is {nstart}, nsamp is {nsamp}"
         )
 
+        return nstart_read, nsamp_read
+
+    def get_chunk(self, tstart=None, tstop=None, for_preprocessing=True):
+        """
+        Get a chunk of data. The data is saved in `self.data`.
+
+        Args:
+            tstart (float): start time of the chunk in seconds
+            tstop (float): stop time of the chunk in seconds
+            for_preprocessing (bool): if the data is to be preprocessed later. This will modify the number of samples
+            read based on the width of the candidate
+
+        """
+        nstart_read, nsamp_read = self.chunk_bounds(
+            tstart=tstart, tstop=tstop, for_preprocessing=for_preprocessing
+        )
         nspectra = int(self.your_header.nspectra)
         if nstart_read >= 0 and nstart_read + nsamp_read <= nspectra:
             logging.debug(

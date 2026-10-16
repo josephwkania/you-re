@@ -50,6 +50,35 @@ def device_count():
         return 0
 
 
+def check_compiler():
+    """
+    Load NVRTC, which compiles the kernels, without making a CUDA context, so
+    a process can check it before forking workers that use the GPU.
+
+    Raises:
+        RuntimeError: if NVRTC cannot be loaded
+    """
+    try:
+        _cupy().cuda.nvrtc.getVersion()
+    except Exception as error:
+        raise RuntimeError(
+            f"CuPy cannot load NVRTC to compile the GPU kernels ({error}). "
+            "Install the NVRTC matching CuPy's CUDA (e.g. pip install "
+            "nvidia-cuda-nvrtc-cu12) or use the CPU (-g -1)."
+        ) from error
+
+
+def release_memory():
+    """
+    Return the memory CuPy's pool keeps to the device, as after a candidate
+    that failed part way. Does nothing if CuPy was never imported.
+    """
+    import sys
+
+    if "cupy" in sys.modules:
+        sys.modules["cupy"].get_default_memory_pool().free_all_blocks()
+
+
 def gpu_errors():
     """
     The exceptions a CUDA call raises when the device fails or runs out of

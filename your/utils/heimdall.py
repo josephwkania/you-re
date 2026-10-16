@@ -1,7 +1,26 @@
+import glob
 import logging
 import math
 import os
 import subprocess
+import time
+
+import numpy as np
+import pandas as pd
+
+# columns of Heimdall's .cand files: boxcar is log2 of the width in samples,
+# first and last are the cluster's first and last samples
+CAND_COLUMNS = (
+    "snr",
+    "sample",
+    "tcand",
+    "boxcar",
+    "dm_index",
+    "dm",
+    "members",
+    "first",
+    "last",
+)
 
 
 def generate_dm_list(
@@ -179,3 +198,76 @@ class HeimdallManager:
 
         logging.info("Using command arguments: %s", cmd)
         subprocess.run(cmd, check=True)
+
+
+def read_cand_file(path):
+    """
+    Heimdall's candidates in one .cand file.
+
+    Args:
+        path (str): .cand file
+
+    Returns:
+        pandas.DataFrame: one row per candidate, columns `CAND_COLUMNS`
+    """
+    # Heimdall writes an empty file for a gulp without candidates
+    rows = np.loadtxt(path, ndmin=2) if os.path.getsize(path) else np.empty((0, 0))
+    if rows.size == 0:
+        return pd.DataFrame(columns=list(CAND_COLUMNS))
+    frame = pd.DataFrame(rows[:, : len(CAND_COLUMNS)], columns=list(CAND_COLUMNS))
+    for column in ("sample", "boxcar", "dm_index", "members", "first", "last"):
+        frame[column] = frame[column].astype(np.int64)
+    return frame
+
+
+class CandWatcher:
+    """
+    New candidates in a directory Heimdall writes .cand files to. Heimdall
+    writes each file whole when it finishes a gulp, so a file is read once
+    its size and modification time have stayed the same for `settle`
+    seconds, and never again.
+
+    Args:
+        cand_dir (str): Heimdall's output directory
+        settle (float): seconds a file must stay unchanged
+    """
+
+    def __init__(self, cand_dir, settle=1.0):
+        self.cand_dir = cand_dir
+        self.settle = settle
+        self.done = set()
+        self._seen = {}
+
+    def poll(self, now=None):
+        """
+        Candidates from the files that have settled since the last call.
+
+        Args:
+            now (float): time to judge settling by; time.time() if None
+
+        Returns:
+            pandas.DataFrame: their candidates, with a `file` column
+        """
+        now = time.time() if now is None else now
+        frames = []
+        for path in sorted(glob.glob(os.path.join(self.cand_dir, "*.cand"))):
+            if path in self.done:
+                continue
+            try:
+                stat = os.stat(path)
+            except FileNotFoundError:
+                continue
+            state = (stat.st_size, stat.st_mtime)
+            if self._seen.get(path, (None, None))[0] != state:
+                self._seen[path] = (state, now)
+                continue
+            if now - self._seen[path][1] < self.settle:
+                continue
+            self.done.add(path)
+            del self._seen[path]
+            frame = read_cand_file(path)
+            frame["file"] = path
+            frames.append(frame)
+        if not frames:
+            return pd.DataFrame(columns=[*CAND_COLUMNS, "file"])
+        return pd.concat(frames, ignore_index=True)
