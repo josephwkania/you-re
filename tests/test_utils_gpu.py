@@ -1,17 +1,26 @@
 import os
 
+import numpy as np
 import pytest
 
 from your.candidate import Candidate
 from your.utils import gpu
-from your.utils.gpu import *
+from your.utils.gpu import (
+    PinnedReadBuffer,
+    delay_table,
+    dmt_delays,
+    ft_delays,
+    gpu_dedisp_and_dmt_crop,
+    gpu_dmt,
+    run_edges,
+)
 from your.utils.misc import crop
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 _install_dir = os.path.abspath(os.path.dirname(__file__))
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dedisperse():
     file = os.path.join(_install_dir, "data/28.fil")
     cand = Candidate(
@@ -33,7 +42,7 @@ def test_gpu_dedisperse():
     assert np.isclose(np.max(cand.dedispersed.T.sum(0)), 47527, atol=1)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dmt():
     file = os.path.join(_install_dir, "data/28.fil")
     cand = Candidate(
@@ -56,7 +65,7 @@ def test_gpu_dmt():
     assert np.max(g_dmt - c_dmt) / np.max(g_dmt) < 0.05
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dedisp_dmt_crop():
     file = os.path.join(_install_dir, "data/28.fil")
     cand = Candidate(
@@ -105,7 +114,7 @@ def _dmt_cand(dm):
 
 # dm 10 collapses the band to 0.03 spans per channel, dm 475 to 0.82, so the
 # two sit either side of the default crossover and take a kernel each
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 @pytest.mark.parametrize("dm", [10, 475.284])
 def test_gpu_dmt_kernels_agree(dm):
     """Which kernel runs is a speed choice, so it must not change the plane."""
@@ -114,7 +123,7 @@ def test_gpu_dmt_kernels_agree(dm):
     assert np.array_equal(runs, channels)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 @pytest.mark.parametrize("dm", [10, 475.284])
 def test_gpu_dmt_matches_cpu(dm):
     cand = _dmt_cand(dm)
@@ -123,7 +132,7 @@ def test_gpu_dmt_matches_cpu(dm):
     assert np.array_equal(gpu_dmt(_dmt_cand(dm)).dmt, cpu)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dmt_picks_each_kernel():
     for dm, expected in ((10, True), (475.284, False)):
         cand = _dmt_cand(dm)
@@ -136,7 +145,7 @@ def test_gpu_dmt_picks_each_kernel():
 
 # candmaker's workers call gpu_dedisp_and_dmt_crop once per candidate in a
 # long-lived process, so the second and later calls are the ones that matter
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dedisp_dmt_crop_repeatable():
     """No call may inherit the previous call's atomic sums."""
     first = gpu_dedisp_and_dmt_crop(_dmt_cand(475.284))
@@ -146,13 +155,17 @@ def test_gpu_dedisp_dmt_crop_repeatable():
         assert np.array_equal(again.dmt, first.dmt)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_gpu_dedisp_dmt_crop_frees_memory():
-    """Device arrays are released on return, not left for the next candidate."""
-    # numba queues frees and only flushes past 10 arrays or 20% of the card;
-    # anything still queued here is held into the next candidate
+    """Device memory goes back to the driver on return, not held for the next."""
+    import cupy
+
+    # CuPy's pool keeps freed blocks for reuse; anything it still holds here
+    # is held into the next candidate
     gpu_dedisp_and_dmt_crop(_dmt_cand(475.284))
-    assert len(pending_frees()._cons) == 0
+    pool = cupy.get_default_memory_pool()
+    assert pool.used_bytes() == 0
+    assert pool.total_bytes() == 0
 
 
 def _window_reference(cand, width=256):
@@ -164,15 +177,13 @@ def _window_reference(cand, width=256):
     rows, ncols = nchans // fdf, nsamples // tdf
     cols = (nsamples // tdf // 2 - width // 2 + np.arange(width)) % ncols
 
-    ft_delays = cuda.device_array(nchans, dtype=np.int64)
-    dedisp_delays[math.ceil(nchans / 128), 128](
-        cuda.to_device(np.array(cand.chan_freqs, dtype=np.float32)),
-        float(cand.dm),
-        float(cand.your_header.tsamp),
-        ft_delays,
-    )
     shifted = np.stack(
-        [np.roll(data[ch], -d) for ch, d in enumerate(ft_delays.copy_to_host())]
+        [
+            np.roll(data[ch], -d)
+            for ch, d in enumerate(
+                ft_delays(cand.chan_freqs, cand.dm, cand.your_header.tsamp)
+            )
+        ]
     )
     ft = shifted[: rows * fdf, : ncols * tdf].reshape(rows, fdf, ncols, tdf).sum((1, 3))
 
@@ -190,7 +201,7 @@ def _window_reference(cand, width=256):
     return ft[:, cols].T.astype(np.float32), dmt[:, cols].astype(np.float32)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 @pytest.mark.parametrize(
     "dm, width, block_from",
     [
@@ -227,7 +238,7 @@ def test_gpu_dedisp_dmt_crop_matches_reference(dm, width, block_from):
     assert np.array_equal(cand.dmt, dmt)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_pinned_read_buffer_reused_and_grown():
     buffer = PinnedReadBuffer(0, granule=2**20)
     first = buffer(10)
@@ -257,10 +268,12 @@ def test_pinned_read_buffer_reused_and_grown():
     assert np.array_equal(cand.dmt, dmt)
 
 
-@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
 def test_pinned_read_buffer_falls_back_when_it_cannot_pin(monkeypatch):
+    import cupy
+
     def refuse(*args, **kwargs):
-        raise CudaAPIError(2, "CUDA_ERROR_OUT_OF_MEMORY")
+        raise cupy.cuda.runtime.CUDARuntimeError(2)  # cudaErrorMemoryAllocation
 
     buffer = PinnedReadBuffer(0, granule=2**20)
     monkeypatch.setattr(gpu, "portable_pinned_array", refuse)
@@ -270,9 +283,7 @@ def test_pinned_read_buffer_falls_back_when_it_cannot_pin(monkeypatch):
     assert buffer(10).size == 2**20
 
 
-@pytest.mark.skipif(
-    not cuda.is_available() or len(cuda.gpus) < 2, reason="requires two GPUs"
-)
+@pytest.mark.skipif(gpu.device_count() < 2, reason="requires two GPUs")
 def test_pinned_read_buffer_serves_every_gpu():
     """One buffer, allocated in one GPU's context, feeds uploads to either GPU."""
     buffer = PinnedReadBuffer(0, granule=2**20)

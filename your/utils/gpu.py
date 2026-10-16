@@ -1,13 +1,428 @@
+import functools
 import logging
 import math
 import subprocess
 
-import numba
 import numpy as np
-from numba import cuda
-from numba.cuda.cudadrv.driver import CudaAPIError
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _cupy():
+    """
+    CuPy, imported the first time a GPU path runs, so the package imports and
+    the CPU paths run without it.
+
+    Returns:
+        module: cupy
+    """
+    try:
+        import cupy
+    except ImportError as error:
+        raise ImportError(
+            "The GPU paths need CuPy: pip install your[gpu], or the cupy "
+            "package matching your CUDA version"
+        ) from error
+    return cupy
+
+
+def available():
+    """
+    Whether CuPy is installed and sees at least one CUDA device.
+
+    Returns:
+        bool: True if the GPU paths can run
+    """
+    return device_count() > 0
+
+
+def device_count():
+    """
+    CUDA devices CuPy sees: none without CuPy, a driver or a device.
+
+    Returns:
+        int: number of devices
+    """
+    try:
+        return _cupy().cuda.runtime.getDeviceCount()
+    except Exception:
+        return 0
+
+
+def gpu_errors():
+    """
+    The exceptions a CUDA call raises when the device fails or runs out of
+    memory, for callers that fall back to the CPU.
+
+    Returns:
+        tuple: exception classes
+    """
+    cupy = _cupy()
+    return (
+        cupy.cuda.runtime.CUDARuntimeError,
+        cupy.cuda.driver.CUDADriverError,
+        cupy.cuda.memory.OutOfMemoryError,
+    )
+
+
+# one thread per output cell throughout, each summing in a register. Sizes
+# and offsets are 64-bit, as numba's were, so a chunk may pass 2**31 bytes.
+# Modulo of a possibly negative value wraps as Python's does, which these
+# kernels relied on under numba.
+_SOURCE = r"""
+typedef long long i64;
+
+__device__ __forceinline__ i64 pymod(i64 x, i64 n) {
+    i64 m = x % n;
+    return m < 0 ? m + n : m;
+}
+
+// Rows `row0 .. row0 + rows` of a (nsamples, nchans) chunk into columns of
+// the (nchans, nsamples) chunk, through a shared-memory tile so both the read
+// and the write are coalesced. Launch with 32x8 threads.
+extern "C" __global__ void transpose_u8(
+    const unsigned char* src, i64 rows, i64 nchans,
+    unsigned char* dst, i64 nsamples, i64 row0)
+{
+    __shared__ unsigned char tile[32][33];
+    const i64 tx = threadIdx.x, ty = threadIdx.y;
+    const i64 bx = (i64)blockIdx.x * 32, by = (i64)blockIdx.y * 32;
+    for (int k = 0; k < 32; k += 8) {
+        const i64 r = by + ty + k, c = bx + tx;
+        if (r < rows && c < nchans) tile[ty + k][tx] = src[r * nchans + c];
+    }
+    __syncthreads();
+    for (int k = 0; k < 32; k += 8) {
+        const i64 r = bx + ty + k, c = by + tx;
+        if (r < nchans && c < rows) dst[r * nsamples + row0 + c] = tile[tx][ty + k];
+    }
+}
+
+// Dedispersed frequency-time plane, decimated and cropped in one pass:
+// `fdf` channels by `tdf` samples per kept output cell. `delays` are wrapped
+// into [0, nsamples); `col0` is the first decimated column kept, wrapping
+// when negative.
+template <typename T, typename A>
+__global__ void dedisp_window(
+    const T* data, i64 nchans, i64 nsamples, const int* delays, i64 fdf,
+    i64 tdf, i64 col0, float* out, i64 rows, i64 width)
+{
+    const i64 col = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 row = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows || col >= width) return;
+    const i64 base = pymod(col0 + col, nsamples / tdf) * tdf;
+    A acc = 0;
+    for (i64 ch = row * fdf; ch < row * fdf + fdf; ch++) {
+        const T* channel = data + ch * nsamples;
+        const i64 d = delays[ch];
+        for (i64 s = base; s < base + tdf; s++) {
+            i64 idx = s + d;
+            if (idx >= nsamples) idx -= nsamples;
+            acc += channel[idx];
+        }
+    }
+    out[row * width + col] = (float)acc;
+}
+
+// DM-time plane, decimated and cropped in one pass: every channel over `tdf`
+// samples per kept (DM, column) cell. Threads of a warp share a column across
+// neighbouring DMs, whose delays barely differ, so their reads land on the
+// same few cache lines. `delays` is (nchans, ndm).
+template <typename T, typename A>
+__global__ void dmt_window(
+    const T* data, i64 nchans, i64 nsamples, const int* delays, i64 ndm,
+    i64 tdf, i64 col0, float* out, i64 width)
+{
+    const i64 kk = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 col = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (kk >= ndm || col >= width) return;
+    const i64 base = pymod(col0 + col, nsamples / tdf) * tdf;
+    A acc = 0;
+    for (i64 ch = 0; ch < nchans; ch++) {
+        const T* channel = data + ch * nsamples;
+        const i64 d = delays[ch * ndm + kk];
+        for (i64 s = base; s < base + tdf; s++) {
+            i64 idx = s + d;
+            if (idx >= nsamples) idx -= nsamples;
+            acc += channel[idx];
+        }
+    }
+    out[kk * width + col] = (float)acc;
+}
+
+#define BLOCK 32
+
+// Sum of each channel over each block of BLOCK samples, written one column
+// right so `block_prefix` can turn each row into exclusive prefix sums.
+// `csum` is (nchans, nblocks + 1).
+template <typename T, typename A>
+__global__ void block_sums(const T* data, i64 nchans, i64 nsamples, A* csum, i64 stride)
+{
+    const i64 b = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 ch = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (ch >= nchans || b >= stride - 1) return;
+    const T* channel = data + ch * nsamples;
+    A acc = 0;
+    for (i64 s = b * BLOCK; s < b * BLOCK + BLOCK; s++) acc += channel[s];
+    csum[ch * stride + b + 1] = acc;
+}
+
+// Running sum along each channel's blocks, so `csum[ch, b]` is the sum of the
+// channel's first `b * BLOCK` samples.
+template <typename A>
+__global__ void block_prefix(A* csum, i64 nchans, i64 stride)
+{
+    const i64 ch = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= nchans) return;
+    A* row = csum + ch * stride;
+    A acc = 0;
+    row[0] = acc;
+    for (i64 b = 1; b < stride; b++) {
+        acc += row[b];
+        row[b] = acc;
+    }
+}
+
+// Add samples `lo .. hi` of one channel, 0 <= lo <= hi <= nsamples: the
+// blocks wholly inside the span as one difference of the prefix sums, and the
+// at most 2 * BLOCK - 2 samples either side of them one by one.
+template <typename T, typename C>
+__device__ __forceinline__ i64 span_sum(
+    const T* channel, const C* csum, i64 lo, i64 hi, i64 acc)
+{
+    const i64 bl = (lo + BLOCK - 1) / BLOCK, bh = hi / BLOCK;
+    if (bl < bh) {
+        for (i64 s = lo; s < bl * BLOCK; s++) acc += channel[s];
+        acc += csum[bh] - csum[bl];
+        for (i64 s = bh * BLOCK; s < hi; s++) acc += channel[s];
+    } else {
+        for (i64 s = lo; s < hi; s++) acc += channel[s];
+    }
+    return acc;
+}
+
+// Add `tdf` samples of one channel from `start`, 0 <= start < 2 * nsamples,
+// wrapping at the end of the chunk as the per-sample kernels do.
+template <typename T, typename C>
+__device__ __forceinline__ i64 wrapped_span_sum(
+    const T* channel, const C* csum, i64 nsamples, i64 start, i64 tdf, i64 acc)
+{
+    if (start >= nsamples) start -= nsamples;
+    const i64 stop = start + tdf;
+    if (stop <= nsamples) return span_sum(channel, csum, start, stop, acc);
+    acc = span_sum(channel, csum, start, nsamples, acc);
+    return span_sum(channel, csum, (i64)0, stop - nsamples, acc);
+}
+
+// `dedisp_window`, adding each channel's `tdf` samples through the block
+// prefix sums `csum` of type C: the same integer sums in about 2 * BLOCK
+// reads, not `tdf`. Integer data only, summed in int64.
+template <typename T, typename C>
+__global__ void dedisp_window_blocks(
+    const T* data, const C* csum, i64 stride, i64 nchans, i64 nsamples,
+    const int* delays, i64 fdf, i64 tdf, i64 col0, float* out, i64 rows, i64 width)
+{
+    const i64 col = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 row = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows || col >= width) return;
+    const i64 base = pymod(col0 + col, nsamples / tdf) * tdf;
+    i64 acc = 0;
+    for (i64 ch = row * fdf; ch < row * fdf + fdf; ch++) {
+        acc = wrapped_span_sum(
+            data + ch * nsamples, csum + ch * stride, nsamples,
+            base + delays[ch], tdf, acc);
+    }
+    out[row * width + col] = (float)acc;
+}
+
+// `dmt_window`, adding each channel's `tdf` samples through the block prefix
+// sums `csum` of type C: the same integer sums in about 2 * BLOCK reads, not
+// `tdf`. Integer data only, summed in int64.
+template <typename T, typename C>
+__global__ void dmt_window_blocks(
+    const T* data, const C* csum, i64 stride, i64 nchans, i64 nsamples,
+    const int* delays, i64 ndm, i64 tdf, i64 col0, float* out, i64 width)
+{
+    const i64 kk = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 col = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (kk >= ndm || col >= width) return;
+    const i64 base = pymod(col0 + col, nsamples / tdf) * tdf;
+    i64 acc = 0;
+    for (i64 ch = 0; ch < nchans; ch++) {
+        acc = wrapped_span_sum(
+            data + ch * nsamples, csum + ch * stride, nsamples,
+            base + delays[ch * ndm + kk], tdf, acc);
+    }
+    out[kk * width + col] = (float)acc;
+}
+
+// Each channel of a (nchans, nsamples) chunk rolled back by its delay,
+// wrapped into [0, nsamples): `out[ch, s] = data[ch, (s + delay) % nsamples]`.
+template <typename T>
+__global__ void roll_channels(
+    const T* data, i64 nchans, i64 nsamples, const i64* delays, T* out)
+{
+    const i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 ch = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (ch >= nchans || s >= nsamples) return;
+    i64 idx = s + delays[ch];
+    if (idx >= nsamples) idx -= nsamples;
+    out[ch * nsamples + s] = data[ch * nsamples + idx];
+}
+
+// One thread per (DM, sample) of the full DM-time plane, summing the channels
+// in a register. `delays` is (ndm, nchans) and may be negative.
+template <typename T, typename A>
+__global__ void dmt_channels(
+    const T* data, i64 nchans, i64 nsamples, const int* delays, i64 ndm, float* out)
+{
+    const i64 jj = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 kk = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (jj >= nsamples || kk >= ndm) return;
+    A acc = 0;
+    for (i64 ii = 0; ii < nchans; ii++) {
+        acc += data[ii * nsamples + pymod(jj + delays[kk * nchans + ii], nsamples)];
+    }
+    out[kk * nsamples + jj] = (float)acc;
+}
+
+// Cumulative sum down the channel axis, one thread per sample, with a leading
+// zero row already in place, so any span of channels sums as one subtraction.
+template <typename T, typename A>
+__global__ void band_cumsum(const T* data, i64 nchans, i64 nsamples, A* cumsum)
+{
+    const i64 jj = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (jj >= nsamples) return;
+    A acc = 0;
+    for (i64 ii = 0; ii < nchans; ii++) {
+        acc += data[ii * nsamples + jj];
+        cumsum[(ii + 1) * nsamples + jj] = acc;
+    }
+}
+
+// As `dmt_channels`, but each span of channels sharing a delay bin is one
+// subtraction of the band cumulative sum. The span tables are (ndm, width).
+template <typename A>
+__global__ void dmt_runs(
+    const A* cumsum, i64 nsamples, const int* starts, const int* stops,
+    const int* delays, const int* nruns, i64 width, i64 ndm, float* out)
+{
+    const i64 jj = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 kk = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (jj >= nsamples || kk >= ndm) return;
+    i64 acc = 0;
+    for (i64 rr = 0; rr < nruns[kk]; rr++) {
+        const i64 idx = pymod(jj + delays[kk * width + rr], nsamples);
+        acc += cumsum[(i64)stops[kk * width + rr] * nsamples + idx]
+             - cumsum[(i64)starts[kk * width + rr] * nsamples + idx];
+    }
+    out[kk * nsamples + jj] = (float)acc;
+}
+"""
+
+_C_TYPES = {
+    np.dtype(np.uint8): "unsigned char",
+    np.dtype(np.int8): "signed char",
+    np.dtype(np.uint16): "unsigned short",
+    np.dtype(np.int16): "short",
+    np.dtype(np.uint32): "unsigned int",
+    np.dtype(np.int32): "int",
+    np.dtype(np.int64): "long long",
+    np.dtype(np.float32): "float",
+    np.dtype(np.float64): "double",
+}
+
+# the templates each (data, accumulator) pair is compiled for
+_TEMPLATES = (
+    "dedisp_window<{t}, {a}>",
+    "dmt_window<{t}, {a}>",
+    "block_sums<{t}, {a}>",
+    "block_prefix<{a}>",
+    "dedisp_window_blocks<{t}, {a}>",
+    "dmt_window_blocks<{t}, {a}>",
+    "roll_channels<{t}>",
+    "dmt_channels<{t}, {a}>",
+    "band_cumsum<{t}, {a}>",
+    "dmt_runs<{a}>",
+)
+
+
+def _c_type(dtype):
+    try:
+        return _C_TYPES[np.dtype(dtype)]
+    except KeyError:
+        raise TypeError(f"no GPU kernels for {np.dtype(dtype)} data") from None
+
+
+@functools.lru_cache(maxsize=None)
+def _module(data_dtype, acc_dtype):
+    """
+    The kernels for one pair of data and accumulator dtypes. CuPy compiles
+    them on first use and keeps the binary in its on-disk cache, so later
+    processes load it instead of compiling.
+    """
+    t, a = _c_type(data_dtype), _c_type(acc_dtype)
+    names = tuple(name.format(t=t, a=a) for name in _TEMPLATES)
+    module = _cupy().RawModule(
+        code=_SOURCE, options=("-std=c++14",), name_expressions=names
+    )
+    return module, t, a
+
+
+def _kernel(name, data_dtype, acc_dtype=np.int64):
+    """
+    A templated kernel, as `name` instantiated for these dtypes.
+
+    Args:
+        name (str): one of the templates in `_TEMPLATES`, without arguments
+        data_dtype: dtype of the data it reads
+        acc_dtype: dtype it sums in
+
+    Returns:
+        cupy.RawKernel: the kernel
+    """
+    module, t, a = _module(np.dtype(data_dtype), np.dtype(acc_dtype))
+    template = next(x for x in _TEMPLATES if x.startswith(name + "<"))
+    return module.get_function(template.format(t=t, a=a))
+
+
+@functools.lru_cache(maxsize=1)
+def _transpose_u8():
+    return (
+        _cupy()
+        .RawModule(code=_SOURCE, options=("-std=c++14",))
+        .get_function("transpose_u8")
+    )
+
+
+def _i64(*values):
+    return tuple(np.int64(v) for v in values)
+
+
+def _wide(dtype):
+    """float64 for float data, int64 otherwise: what numba summed in."""
+    return np.float64 if np.issubdtype(dtype, np.floating) else np.int64
+
+
+def ft_delays(chan_freqs, dm, tsamp):
+    """
+    Per-channel shift at the candidate's DM, rounded as the atomic
+    dedispersion kernels rounded it in-line: float32 frequencies squared in
+    float32, the rest in float64, rounded half to even.
+
+    Args:
+        chan_freqs (numpy.ndarray): channel frequencies, MHz
+        dm (float): dispersion measure
+        tsamp (float): sampling time, seconds
+
+    Returns:
+        numpy.ndarray: (nchans,) int64 shift in samples, unwrapped
+    """
+    f = np.asarray(chan_freqs, dtype=np.float32)
+    squares = (f * f).astype(np.float64)
+    shift = -4148808.0 * float(dm) * (1 / squares[0] - 1 / squares) / 1000
+    return np.round(shift / float(tsamp)).astype(np.int64)
 
 
 def gpu_dedisperse(cand, device=0):
@@ -23,112 +438,23 @@ def gpu_dedisperse(cand, device=0):
         candidate object
 
     """
-    cuda.select_device(device)
-    chan_freqs = cuda.to_device(np.array(cand.chan_freqs, dtype=np.float32))
-    cand_data_in = cuda.to_device(np.array(cand.data.T, dtype=cand.your_header.dtype))
-    cand_data_out = cuda.to_device(
-        np.zeros_like(cand.data.T, dtype=cand.your_header.dtype)
-    )
-
-    @cuda.jit
-    def gpu_dedisp(cand_data_in, chan_freqs, dm, cand_data_out, tsamp):
-        ii, jj = cuda.grid(2)
-        if ii < cand_data_in.shape[0] and jj < cand_data_in.shape[1]:
-            disp_time = int(
-                round(
-                    -4148808.0
-                    * dm
-                    * (1 / (chan_freqs[0]) ** 2 - 1 / (chan_freqs[ii]) ** 2)
-                    / 1000
-                    / tsamp
-                )
-            )
-            cand_data_out[ii, jj] = cand_data_in[
-                ii, (jj + disp_time) % cand_data_in.shape[1]
-            ]
-
-    threadsperblock = (32, 32)
-    blockspergrid_x = math.ceil(cand_data_in.shape[0] / threadsperblock[0])
-    blockspergrid_y = math.ceil(cand_data_in.shape[1] / threadsperblock[1])
-
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-
-    gpu_dedisp[blockspergrid, threadsperblock](
-        cand_data_in,
-        chan_freqs,
-        float(cand.dm),
-        cand_data_out,
-        float(cand.your_header.tsamp),
-    )
-
-    cand.dedispersed = cand_data_out.copy_to_host().T
+    cupy = _cupy()
+    data = np.ascontiguousarray(np.asarray(cand.data).T, dtype=cand.your_header.dtype)
+    nchans, nsamples = data.shape
+    delays = ft_delays(cand.chan_freqs, cand.dm, cand.your_header.tsamp) % nsamples
+    with cupy.cuda.Device(device):
+        data_in = cupy.asarray(data)
+        out = cupy.empty_like(data_in)
+        _kernel("roll_channels", data.dtype)(
+            (math.ceil(nsamples / 32), math.ceil(nchans / 32)),
+            (32, 32),
+            (data_in, *_i64(nchans, nsamples), cupy.asarray(delays), out),
+        )
+        cand.dedispersed = out.get().T
+        del data_in, out
+        cupy.get_default_memory_pool().free_all_blocks()
 
     return cand
-
-
-@cuda.jit
-def dmt_channels(cand_data_in, delays, cand_data_out):
-    """
-    One thread per (DM, sample), summing the channels in a register.
-
-    Args:
-        cand_data_in: (nchans, nsamples) chunk, channel major
-        delays: (ndm, nchans) sample shift per DM and channel
-        cand_data_out: (ndm, nsamples) DM-time plane
-
-    """
-    jj, kk = cuda.grid(2)
-    nsamples = cand_data_in.shape[1]
-    if jj < nsamples and kk < cand_data_out.shape[0]:
-        acc = 0
-        for ii in range(cand_data_in.shape[0]):
-            # a negative shift wraps, Python modulo semantics, as numba gives
-            acc += cand_data_in[ii, (jj + delays[kk, ii]) % nsamples]
-        cand_data_out[kk, jj] = acc
-
-
-@cuda.jit
-def dmt_runs(cumsum, starts, stops, delays, nruns, cand_data_out):
-    """
-    As `dmt_channels`, but each span of channels sharing a delay bin is one
-    subtraction of the band cumulative sum rather than a loop over its channels.
-
-    Args:
-        cumsum: (nchans + 1, nsamples) cumulative sum down the channel axis
-        starts: (ndm, nruns) first channel of each span
-        stops: (ndm, nruns) one past the last channel of each span
-        delays: (ndm, nruns) sample shift of each span
-        nruns: (ndm,) spans this DM actually has, the rest being padding
-        cand_data_out: (ndm, nsamples) DM-time plane
-
-    """
-    jj, kk = cuda.grid(2)
-    nsamples = cumsum.shape[1]
-    if jj < nsamples and kk < cand_data_out.shape[0]:
-        acc = 0
-        for rr in range(nruns[kk]):
-            idx = (jj + delays[kk, rr]) % nsamples
-            acc += cumsum[stops[kk, rr], idx] - cumsum[starts[kk, rr], idx]
-        cand_data_out[kk, jj] = acc
-
-
-@cuda.jit
-def band_cumsum(cand_data_in, cumsum):
-    """
-    Cumulative sum down the channel axis, one thread per sample, with a leading
-    zero row so any contiguous span of channels sums as one subtraction.
-
-    Args:
-        cand_data_in: (nchans, nsamples) chunk, channel major
-        cumsum: (nchans + 1, nsamples) output, row 0 already zeroed
-
-    """
-    jj = cuda.grid(1)
-    if jj < cand_data_in.shape[1]:
-        acc = 0
-        for ii in range(cand_data_in.shape[0]):
-            acc += cand_data_in[ii, jj]
-            cumsum[ii + 1, jj] = acc
 
 
 def delay_table(chan_freqs, tsamp, dms):
@@ -224,7 +550,7 @@ def gpu_dmt(cand, device=0, dmsteps=256, max_run_fraction=0.6):
         candidate object
 
     """
-    cuda.select_device(device)
+    cupy = _cupy()
     nsamples, nchans = cand.data.shape
     tsamp = float(cand.your_header.tsamp)
     chan_freqs = np.asarray(cand.chan_freqs, dtype=np.float64)
@@ -236,65 +562,58 @@ def gpu_dmt(cand, device=0, dmsteps=256, max_run_fraction=0.6):
     edge, nruns = run_edges(delays)
     fraction = float(nruns.mean()) / nchans
 
-    cand_data_in = cuda.to_device(np.ascontiguousarray(cand.data.T))
-    dmt_return = cuda.device_array((dmsteps, nsamples), dtype=np.float32)
+    data = np.ascontiguousarray(cand.data.T)
     threads = 128
     blocks = math.ceil(nsamples / threads)
 
-    if fraction <= max_run_fraction:
-        logger.debug(f"{fraction:.2f} spans per channel, summing runs")
-        # int32 holds the whole band for any real filterbank; widen if it cannot
-        info = np.iinfo(cand.data.dtype)
-        bound = nchans * max(abs(int(info.min)), int(info.max))
-        acc_dtype = np.int32 if bound <= np.iinfo(np.int32).max else np.int64
-        starts, stops, run_delays = run_table(delays, edge, nruns)
-        cumsum = cuda.device_array((nchans + 1, nsamples), dtype=acc_dtype)
-        cumsum[0].copy_to_device(np.zeros(nsamples, dtype=acc_dtype))
-        band_cumsum[blocks, threads](cand_data_in, cumsum)
-        dmt_runs[(blocks, dmsteps), (threads, 1)](
-            cumsum,
-            cuda.to_device(starts),
-            cuda.to_device(stops),
-            cuda.to_device(run_delays),
-            cuda.to_device(nruns),
-            dmt_return,
-        )
-    else:
-        logger.debug(f"{fraction:.2f} spans per channel, summing channels")
-        dmt_channels[(blocks, dmsteps), (threads, 1)](
-            cand_data_in, cuda.to_device(delays), dmt_return
-        )
+    with cupy.cuda.Device(device):
+        cand_data_in = cupy.asarray(data)
+        dmt_return = cupy.empty((dmsteps, nsamples), dtype=np.float32)
+        if fraction <= max_run_fraction:
+            logger.debug(f"{fraction:.2f} spans per channel, summing runs")
+            # int32 holds the whole band for any real filterbank; widen if it cannot
+            info = np.iinfo(cand.data.dtype)
+            bound = nchans * max(abs(int(info.min)), int(info.max))
+            acc_dtype = np.int32 if bound <= np.iinfo(np.int32).max else np.int64
+            starts, stops, run_delays = run_table(delays, edge, nruns)
+            cumsum = cupy.empty((nchans + 1, nsamples), dtype=acc_dtype)
+            cumsum[0] = 0
+            _kernel("band_cumsum", data.dtype, acc_dtype)(
+                (blocks,), (threads,), (cand_data_in, *_i64(nchans, nsamples), cumsum)
+            )
+            _kernel("dmt_runs", data.dtype, acc_dtype)(
+                (blocks, dmsteps),
+                (threads, 1),
+                (
+                    cumsum,
+                    np.int64(nsamples),
+                    cupy.asarray(starts),
+                    cupy.asarray(stops),
+                    cupy.asarray(run_delays),
+                    cupy.asarray(nruns),
+                    *_i64(starts.shape[1], dmsteps),
+                    dmt_return,
+                ),
+            )
+        else:
+            logger.debug(f"{fraction:.2f} spans per channel, summing channels")
+            _kernel("dmt_channels", data.dtype, _wide(data.dtype))(
+                (blocks, dmsteps),
+                (threads, 1),
+                (
+                    cand_data_in,
+                    *_i64(nchans, nsamples),
+                    cupy.asarray(np.ascontiguousarray(delays)),
+                    np.int64(dmsteps),
+                    dmt_return,
+                ),
+            )
 
-    cand.dmt = dmt_return.copy_to_host()
+        cand.dmt = dmt_return.get()
+        del cand_data_in, dmt_return
+        cupy.get_default_memory_pool().free_all_blocks()
 
     return cand
-
-
-@cuda.jit
-def transpose_u8(src, dst, row0):
-    """
-    Rows `row0 .. row0 + len(src)` of a (nsamples, nchans) chunk into columns
-    of the (nchans, nsamples) chunk, through a shared-memory tile so both the
-    read and the write are coalesced. Launch with 32x8 threads.
-
-    Args:
-        src: (rows, nchans) uint8 slice of the chunk as read
-        dst: (nchans, nsamples) uint8
-        row0: sample the slice starts at
-
-    """
-    tile = cuda.shared.array((32, 33), dtype=numba.uint8)
-    tx, ty = cuda.threadIdx.x, cuda.threadIdx.y
-    bx, by = cuda.blockIdx.x * 32, cuda.blockIdx.y * 32
-    for k in range(0, 32, 8):
-        r, c = by + ty + k, bx + tx
-        if r < src.shape[0] and c < src.shape[1]:
-            tile[ty + k, tx] = src[r, c]
-    cuda.syncthreads()
-    for k in range(0, 32, 8):
-        r, c = bx + ty + k, by + tx
-        if r < dst.shape[0] and c < src.shape[0]:
-            dst[r, row0 + c] = tile[tx, ty + k]
 
 
 def portable_pinned_array(size):
@@ -308,8 +627,10 @@ def portable_pinned_array(size):
     Returns:
         numpy.ndarray: page-locked uint8 array
     """
-    memory = cuda.current_context().memhostalloc(size, portable=True)
-    return np.ndarray(size, dtype=np.uint8, buffer=memory)
+    cupy = _cupy()
+    memory = cupy.cuda.PinnedMemory(size, cupy.cuda.runtime.hostAllocPortable)
+    # the array's base holds the pointer, which holds the memory
+    return np.frombuffer(cupy.cuda.PinnedMemoryPointer(memory, 0), np.uint8, size)
 
 
 class PinnedReadBuffer:
@@ -336,12 +657,12 @@ class PinnedReadBuffer:
 
     def __call__(self, nbytes):
         if self.buffer is None or self.buffer.size < nbytes:
-            cuda.select_device(self.device)
             self.buffer = None
             size = -(-nbytes // self.granule) * self.granule
             try:
-                self.buffer = portable_pinned_array(size)
-            except CudaAPIError:
+                with _cupy().cuda.Device(self.device):
+                    self.buffer = portable_pinned_array(size)
+            except gpu_errors():
                 # more than the host will lock: read this chunk into ordinary
                 # memory, as without a buffer, and try again next time
                 logger.warning(f"Could not pin {size} bytes, reading unpinned")
@@ -358,239 +679,30 @@ def to_device_channel_major(data, stream, staging_bytes=128 * 2**20):
 
     Args:
         data: (nsamples, nchans) uint8 chunk
-        stream: CUDA stream to copy and transpose on
+        stream: cupy.cuda.Stream to copy and transpose on, current
         staging_bytes (int): size of the reused slice buffer
 
     Returns:
-        numba.cuda.cudadrv.devicearray.DeviceNDArray: (nchans, nsamples) chunk
+        cupy.ndarray: (nchans, nsamples) chunk
     """
+    cupy = _cupy()
     nsamples, nchans = data.shape
-    out = cuda.device_array((nchans, nsamples), dtype=np.uint8, stream=stream)
+    out = cupy.empty((nchans, nsamples), dtype=np.uint8)
     step = max(32, staging_bytes // nchans // 32 * 32)
-    staging = cuda.device_array(
-        (min(step, nsamples), nchans), dtype=np.uint8, stream=stream
-    )
+    staging = cupy.empty((min(step, nsamples), nchans), dtype=np.uint8)
     for row0 in range(0, nsamples, step):
         rows = min(step, nsamples - row0)
         part = staging[:rows]
-        part.copy_to_device(
-            np.ascontiguousarray(data[row0 : row0 + rows]), stream=stream
-        )
-        transpose_u8[(math.ceil(nchans / 32), math.ceil(rows / 32)), (32, 8), stream](
-            part, out, row0
+        part.set(np.ascontiguousarray(data[row0 : row0 + rows]), stream=stream)
+        _transpose_u8()(
+            (math.ceil(nchans / 32), math.ceil(rows / 32)),
+            (32, 8),
+            (part, *_i64(rows, nchans), out, *_i64(nsamples, row0)),
         )
     # stream order already keeps each slice's copy behind the previous
     # transpose; wait here so the staging buffer is free to release
     stream.synchronize()
     return out
-
-
-@cuda.jit
-def dedisp_window(data, delays, fdf, tdf, col0, zero, out):
-    """
-    Dedispersed frequency-time plane, decimated and cropped in one pass: one
-    thread per kept output cell, summing its `fdf` channels by `tdf` samples in
-    a register. Nothing is computed for the columns the crop throws away.
-
-    Args:
-        data: (nchans, nsamples) chunk, channel major
-        delays: (nchans,) shift per channel, already wrapped into [0, nsamples)
-        fdf: channels per output row
-        tdf: samples per output column
-        col0: first decimated column kept; negative wraps, as the crop did
-        zero: one-element array whose dtype the sum accumulates in
-        out: (nchans // fdf, width) output window
-
-    """
-    col, row = cuda.grid(2)
-    nsamples = data.shape[1]
-    ncols = nsamples // tdf
-    if row < out.shape[0] and col < out.shape[1]:
-        acc = zero[0]
-        base = ((col0 + col) % ncols) * tdf
-        for ch in range(row * fdf, row * fdf + fdf):
-            d = delays[ch]
-            for s in range(base, base + tdf):
-                idx = s + d
-                if idx >= nsamples:
-                    idx -= nsamples
-                acc += data[ch, idx]
-        out[row, col] = acc
-
-
-@cuda.jit
-def dmt_window(data, delays, tdf, col0, zero, out):
-    """
-    DM-time plane, decimated and cropped in one pass: one thread per kept
-    (DM, column) cell summing every channel over its `tdf` samples in a
-    register, in place of one atomic add per channel and sample. Threads of a
-    warp share a column across neighbouring DMs, whose delays barely differ,
-    so their reads land on the same few cache lines.
-
-    Args:
-        data: (nchans, nsamples) chunk, channel major
-        delays: (nchans, ndm) shift per channel and DM, wrapped into [0, nsamples)
-        tdf: samples per output column
-        col0: first decimated column kept; negative wraps, as the crop did
-        zero: one-element array whose dtype the sum accumulates in
-        out: (ndm, width) output window
-
-    """
-    kk, col = cuda.grid(2)
-    nchans, nsamples = data.shape
-    ncols = nsamples // tdf
-    if kk < out.shape[0] and col < out.shape[1]:
-        acc = zero[0]
-        base = ((col0 + col) % ncols) * tdf
-        for ch in range(nchans):
-            d = delays[ch, kk]
-            for s in range(base, base + tdf):
-                idx = s + d
-                if idx >= nsamples:
-                    idx -= nsamples
-                acc += data[ch, idx]
-        out[kk, col] = acc
-
-
-# samples per block of the block prefix sums
-BLOCK = 32
-
-
-@cuda.jit
-def block_sums(data, csum):
-    """
-    Sum of each channel over each block of `BLOCK` samples: one thread per
-    (channel, block), neighbouring threads on neighbouring blocks. Written one
-    column right, so `block_prefix` can turn the rows into exclusive prefix sums.
-
-    Args:
-        data: (nchans, nsamples) chunk, channel major
-        csum: (nchans, nsamples // BLOCK + 1) output; column 0 is not written
-
-    """
-    b, ch = cuda.grid(2)
-    if ch < data.shape[0] and b < csum.shape[1] - 1:
-        acc = csum[0, 0] - csum[0, 0]
-        for s in range(b * BLOCK, b * BLOCK + BLOCK):
-            acc += data[ch, s]
-        csum[ch, b + 1] = acc
-
-
-@cuda.jit
-def block_prefix(csum):
-    """
-    Running sum along each channel's blocks, one thread per channel, so
-    `csum[ch, b]` is the sum of the channel's first `b * BLOCK` samples.
-
-    Args:
-        csum: (nchans, nblocks + 1) block sums from `block_sums`
-
-    """
-    ch = cuda.grid(1)
-    if ch < csum.shape[0]:
-        acc = csum[ch, 0] - csum[ch, 0]
-        csum[ch, 0] = acc
-        for b in range(1, csum.shape[1]):
-            acc += csum[ch, b]
-            csum[ch, b] = acc
-
-
-@cuda.jit(device=True, inline=True)
-def span_sum(data, csum, ch, lo, hi, acc):
-    """
-    Add samples `lo .. hi` of one channel, 0 <= lo <= hi <= nsamples: the
-    blocks wholly inside the span as one difference of the prefix sums, and
-    the at most `2 * BLOCK - 2` samples either side of them one by one.
-    """
-    bl = (lo + BLOCK - 1) // BLOCK
-    bh = hi // BLOCK
-    if bl < bh:
-        for s in range(lo, bl * BLOCK):
-            acc += data[ch, s]
-        acc += csum[ch, bh] - csum[ch, bl]
-        for s in range(bh * BLOCK, hi):
-            acc += data[ch, s]
-    else:
-        for s in range(lo, hi):
-            acc += data[ch, s]
-    return acc
-
-
-@cuda.jit(device=True, inline=True)
-def wrapped_span_sum(data, csum, ch, start, tdf, acc):
-    """
-    Add `tdf` samples of one channel from `start`, 0 <= start < 2 * nsamples,
-    wrapping at the end of the chunk as the per-sample kernels do.
-    """
-    nsamples = data.shape[1]
-    if start >= nsamples:
-        start -= nsamples
-    stop = start + tdf
-    if stop <= nsamples:
-        return span_sum(data, csum, ch, start, stop, acc)
-    acc = span_sum(data, csum, ch, start, nsamples, acc)
-    return span_sum(data, csum, ch, 0, stop - nsamples, acc)
-
-
-@cuda.jit
-def dedisp_window_blocks(data, csum, delays, fdf, tdf, col0, zero, out):
-    """
-    `dedisp_window`, adding each channel's `tdf` samples through the block
-    prefix sums: the same integer sums in about `2 * BLOCK` reads, not `tdf`.
-    """
-    col, row = cuda.grid(2)
-    ncols = data.shape[1] // tdf
-    if row < out.shape[0] and col < out.shape[1]:
-        acc = zero[0]
-        base = ((col0 + col) % ncols) * tdf
-        for ch in range(row * fdf, row * fdf + fdf):
-            acc = wrapped_span_sum(data, csum, ch, base + delays[ch], tdf, acc)
-        out[row, col] = acc
-
-
-@cuda.jit
-def dmt_window_blocks(data, csum, delays, tdf, col0, zero, out):
-    """
-    `dmt_window`, adding each channel's `tdf` samples through the block
-    prefix sums: the same integer sums in about `2 * BLOCK` reads, not `tdf`.
-    """
-    kk, col = cuda.grid(2)
-    nchans, nsamples = data.shape
-    ncols = nsamples // tdf
-    if kk < out.shape[0] and col < out.shape[1]:
-        acc = zero[0]
-        base = ((col0 + col) % ncols) * tdf
-        for ch in range(nchans):
-            acc = wrapped_span_sum(data, csum, ch, base + delays[ch, kk], tdf, acc)
-        out[kk, col] = acc
-
-
-@cuda.jit
-def dedisp_delays(chan_freqs, dm, tsamp, delays):
-    """
-    Per-channel shift at the candidate's DM, written exactly as the atomic
-    dedispersion kernel computed it in-line, so every channel lands in the same
-    sample it did: float32 frequencies, float64 DM and sampling time.
-
-    Args:
-        chan_freqs: (nchans,) float32 channel frequencies, MHz
-        dm (float): dispersion measure
-        tsamp (float): sampling time, seconds
-        delays: (nchans,) int64 output, unwrapped
-
-    """
-    ii = cuda.grid(1)
-    if ii < chan_freqs.shape[0]:
-        disp_time = int(
-            round(
-                -4148808.0
-                * dm
-                * (1 / (chan_freqs[0]) ** 2 - 1 / (chan_freqs[ii]) ** 2)
-                / 1000
-                / tsamp
-            )
-        )
-        delays[ii] = disp_time
 
 
 def dmt_delays(cand, dms):
@@ -616,6 +728,10 @@ def dmt_delays(cand, dms):
     ).astype(np.int64)
 
 
+# samples per block of the block prefix sums; BLOCK in the kernels
+BLOCK = 32
+
+
 def accumulator(dtype, count):
     """
     Narrowest exact accumulator for `count` samples of `dtype`: int32 while the
@@ -626,13 +742,13 @@ def accumulator(dtype, count):
         count (int): samples summed into one output cell
 
     Returns:
-        numpy.ndarray: one-element zero of the accumulator dtype
+        numpy.dtype: the accumulator dtype
     """
     if not np.issubdtype(dtype, np.integer):
-        return np.zeros(1, dtype=np.float64)
+        return np.dtype(np.float64)
     info = np.iinfo(dtype)
     bound = count * max(abs(int(info.min)), int(info.max))
-    return np.zeros(1, dtype=np.int32 if bound <= np.iinfo(np.int32).max else np.int64)
+    return np.dtype(np.int32 if bound <= np.iinfo(np.int32).max else np.int64)
 
 
 def gpu_dedisp_and_dmt_crop(cand, device=0, width=256, block_from=4 * BLOCK):
@@ -678,107 +794,125 @@ def gpu_dedisp_and_dmt_crop(cand, device=0, width=256, block_from=4 * BLOCK):
     logger.debug(f"Freq decimation factor: {fdf}")
     logger.debug(f"Time decimation factor: {tdf}")
 
-    cuda.select_device(device)
-    stream = cuda.stream()
-
     # the chunk arrives (nsamples, nchans) in whatever dtype get_chunk left it
-    # (float64 where it padded with the median); cast as before, then put it
-    # channel major, on the device where that is quick
+    # (float64 where it padded with the median); cast as before
     data = np.asarray(cand.data).astype(cand.your_header.dtype, copy=False)
-    if data.dtype == np.uint8:
-        cand_data_in = to_device_channel_major(data, stream)
-    else:
-        cand_data_in = cuda.to_device(np.ascontiguousarray(data.T), stream=stream)
-
-    ft_delays = cuda.device_array(nchans, dtype=np.int64, stream=stream)
-    dedisp_delays[math.ceil(nchans / 128), 128, stream](
-        cuda.to_device(np.array(cand.chan_freqs, dtype=np.float32), stream=stream),
-        float(cand.dm),
-        float(cand.your_header.tsamp),
-        ft_delays,
-    )
-    ft_host = ft_delays.copy_to_host(stream=stream)
-    stream.synchronize()
-    # wrapped here so the kernels need one compare, not a 64-bit modulo
-    ft_delays = cuda.to_device(
-        (ft_host % nsamples).astype(np.int32),
-        stream=stream,
-    )
-    delays = dmt_delays(cand, np.linspace(0, 2 * cand.dm, 256))
-    dmt_delay_table = cuda.to_device(
-        np.ascontiguousarray(delays % nsamples).astype(np.int32), stream=stream
-    )
-
-    ft_out = cuda.device_array((rows, width), dtype=np.float32, stream=stream)
-    dmt_out = cuda.device_array((256, width), dtype=np.float32, stream=stream)
-    ft_zero = cuda.to_device(accumulator(data.dtype, fdf * tdf), stream=stream)
-    dmt_zero = cuda.to_device(accumulator(data.dtype, nchans * tdf), stream=stream)
-
-    logger.debug("Allocated arrays on the GPU")
-
-    ft_grid = (math.ceil(width / 32), math.ceil(rows / 8)), (32, 8), stream
-    dmt_grid = (math.ceil(256 / 32), math.ceil(width / 4)), (32, 4), stream
+    # delays on the host, wrapped so the kernels need one compare, not a
+    # 64-bit modulo
+    ft_host = ft_delays(cand.chan_freqs, cand.dm, cand.your_header.tsamp)
+    ft_host = (ft_host % nsamples).astype(np.int32)
+    dmt_host = dmt_delays(cand, np.linspace(0, 2 * cand.dm, 256))
+    dmt_host = np.ascontiguousarray(dmt_host % nsamples).astype(np.int32)
+    ft_acc = accumulator(data.dtype, fdf * tdf)
+    dmt_acc = accumulator(data.dtype, nchans * tdf)
     nblocks = nsamples // BLOCK
-    if tdf >= block_from and nblocks and np.issubdtype(data.dtype, np.integer):
-        logger.debug(f"Summing blocks of {BLOCK} samples")
-        # int32 prefix sums while a whole channel cannot overflow them
-        csum = cuda.device_array(
-            (nchans, nblocks + 1),
-            dtype=accumulator(data.dtype, nsamples).dtype,
-            stream=stream,
-        )
-        block_sums[(math.ceil(nblocks / 32), math.ceil(nchans / 4)), (32, 4), stream](
-            cand_data_in, csum
-        )
-        block_prefix[math.ceil(nchans / 128), 128, stream](csum)
-        dedisp_window_blocks[ft_grid](
-            cand_data_in, csum, ft_delays, fdf, tdf, col0, ft_zero, ft_out
-        )
-        dmt_window_blocks[dmt_grid](
-            cand_data_in, csum, dmt_delay_table, tdf, col0, dmt_zero, dmt_out
-        )
-    else:
-        csum = None
-        dedisp_window[ft_grid](cand_data_in, ft_delays, fdf, tdf, col0, ft_zero, ft_out)
-        dmt_window[dmt_grid](
-            cand_data_in, dmt_delay_table, tdf, col0, dmt_zero, dmt_out
-        )
-    cand.dedispersed = ft_out.copy_to_host(stream=stream).T
-    cand.dmt = dmt_out.copy_to_host(stream=stream)
-    stream.synchronize()
+    blocks = tdf >= block_from and nblocks and np.issubdtype(data.dtype, np.integer)
 
-    logger.debug("cand.dedispersed and cand.dmt set!")
+    cupy = _cupy()
+    with cupy.cuda.Device(device):
+        stream = cupy.cuda.Stream(non_blocking=True)
+        with stream:
+            # channel major, transposed on the device where that is quick
+            if data.dtype == np.uint8:
+                cand_data_in = to_device_channel_major(data, stream)
+            else:
+                cand_data_in = cupy.empty((nchans, nsamples), dtype=data.dtype)
+                cand_data_in.set(np.ascontiguousarray(data.T), stream=stream)
+            ft_delay_table = cupy.asarray(ft_host)
+            dmt_delay_table = cupy.asarray(dmt_host)
+            ft_out = cupy.empty((rows, width), dtype=np.float32)
+            dmt_out = cupy.empty((256, width), dtype=np.float32)
 
-    # numba defers frees until 10 arrays or 20% of the card are pending, and a
-    # wide candidate's chunk is under that, so it would stay allocated into the
-    # next candidate. One process retries after flushing, but candmaker's
-    # workers cannot flush each other, so two chunks per worker ran the card
-    # out of memory. Free them now.
-    del (
-        cand_data_in,
-        csum,
-        ft_delays,
-        dmt_delay_table,
-        ft_out,
-        dmt_out,
-        ft_zero,
-        dmt_zero,
-    )
-    pending_frees().clear()
+            logger.debug("Allocated arrays on the GPU")
+
+            ft_grid = (math.ceil(width / 32), math.ceil(rows / 8)), (32, 8)
+            dmt_grid = (math.ceil(256 / 32), math.ceil(width / 4)), (32, 4)
+            shape = _i64(nchans, nsamples)
+            if blocks:
+                logger.debug(f"Summing blocks of {BLOCK} samples")
+                # int32 prefix sums while a whole channel cannot overflow them
+                csum_acc = accumulator(data.dtype, nsamples)
+                csum = cupy.empty((nchans, nblocks + 1), dtype=csum_acc)
+                stride = np.int64(nblocks + 1)
+                _kernel("block_sums", data.dtype, csum_acc)(
+                    (math.ceil(nblocks / 32), math.ceil(nchans / 4)),
+                    (32, 4),
+                    (cand_data_in, *shape, csum, stride),
+                )
+                _kernel("block_prefix", data.dtype, csum_acc)(
+                    (math.ceil(nchans / 128),),
+                    (128,),
+                    (csum, np.int64(nchans), stride),
+                )
+                _kernel("dedisp_window_blocks", data.dtype, csum_acc)(
+                    *ft_grid,
+                    (
+                        cand_data_in,
+                        csum,
+                        stride,
+                        *shape,
+                        ft_delay_table,
+                        *_i64(fdf, tdf, col0),
+                        ft_out,
+                        *_i64(rows, width),
+                    ),
+                )
+                _kernel("dmt_window_blocks", data.dtype, csum_acc)(
+                    *dmt_grid,
+                    (
+                        cand_data_in,
+                        csum,
+                        stride,
+                        *shape,
+                        dmt_delay_table,
+                        *_i64(256, tdf, col0),
+                        dmt_out,
+                        np.int64(width),
+                    ),
+                )
+            else:
+                csum = None
+                _kernel("dedisp_window", data.dtype, ft_acc)(
+                    *ft_grid,
+                    (
+                        cand_data_in,
+                        *shape,
+                        ft_delay_table,
+                        *_i64(fdf, tdf, col0),
+                        ft_out,
+                        *_i64(rows, width),
+                    ),
+                )
+                _kernel("dmt_window", data.dtype, dmt_acc)(
+                    *dmt_grid,
+                    (
+                        cand_data_in,
+                        *shape,
+                        dmt_delay_table,
+                        *_i64(256, tdf, col0),
+                        dmt_out,
+                        np.int64(width),
+                    ),
+                )
+            cand.dedispersed = ft_out.get(stream=stream).T
+            cand.dmt = dmt_out.get(stream=stream)
+            stream.synchronize()
+
+        logger.debug("cand.dedispersed and cand.dmt set!")
+
+        # CuPy's pool would keep the chunk's memory for this process, and
+        # candmaker's workers share the card, so two chunks per worker could
+        # run it out of memory. Return it to the driver now.
+        del (
+            cand_data_in,
+            csum,
+            ft_delay_table,
+            dmt_delay_table,
+            ft_out,
+            dmt_out,
+        )
+        cupy.get_default_memory_pool().free_all_blocks()
     return cand
-
-
-def pending_frees():
-    """
-    The queue numba holds freed device arrays in until it flushes them. Since
-    the external memory manager interface it belongs to the memory manager;
-    `Context.deallocations` is a separate, unused queue there.
-
-    Returns:
-        numba's pending deallocations for the current context
-    """
-    ctx = cuda.current_context()
-    return getattr(ctx.memory_manager, "deallocations", ctx.deallocations)
 
 
 def get_gpu_memory_map(gpu_id):

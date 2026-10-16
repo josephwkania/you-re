@@ -3,8 +3,8 @@
 Compares the GPU candmaker planes (your.utils.gpu.gpu_dedisp_and_dmt_crop)
 with independent NumPy references. Run from outside the source tree (or use
 python -I) to verify the installed package. No fixtures or optional test
-framework are required. Without a CUDA device it reports SKIP, or fails with
---require-gpu.
+framework are required. Without CuPy or a CUDA device it reports SKIP, or fails
+with --require-gpu.
 
 Contract checked, for every output cell:
 
@@ -138,7 +138,7 @@ def sample(rng, dtype, shape):
     return rng.standard_normal(shape).astype(dtype) * 100
 
 
-def direct_checks(gpu, cuda):
+def direct_checks(gpu):
     rng = np.random.default_rng(20260928)
     tsamp = 1.2665e-3
     # (nsamples, nchans, width in samples, DM, band): narrow and wide
@@ -205,11 +205,11 @@ def direct_checks(gpu, cuda):
     data = sample(rng, np.uint8, (32768, 512))
     freqs = 1500.0 - 0.5 * np.arange(512)
     first = planes(gpu, data, freqs, 2000.0, tsamp, 2048)
-    for device in list(range(len(cuda.gpus))) * 2:
+    for device in list(range(gpu.device_count())) * 2:
         got = planes(gpu, data, freqs, 2000.0, tsamp, 2048, device=device)
         same(got[0], first[0], f"device {device} FT")
         same(got[1], first[1], f"device {device} DMT")
-    print(f"  ok repeatable on {len(cuda.gpus)} device(s)", flush=True)
+    print(f"  ok repeatable on {gpu.device_count()} device(s)", flush=True)
 
     # fewer than 256 channels is refused, not silently wrong
     try:
@@ -220,7 +220,7 @@ def direct_checks(gpu, cuda):
         raise AssertionError("fewer than 256 channels did not raise IndexError")
 
 
-def public_checks(gpu, cuda):
+def public_checks(gpu):
     """A read through the page-locked buffer gives the planes a plain read does."""
     import os
     import tempfile
@@ -289,17 +289,16 @@ def main():
         "--require-gpu", action="store_true", help="fail rather than skip"
     )
     args = parser.parse_args()
-    from numba import cuda
-
-    if not cuda.is_available():
-        if args.require_gpu:
-            raise SystemExit("FAIL: no CUDA device")
-        print("SKIP: no CUDA device")
-        return
     from your.utils import gpu
 
-    direct_checks(gpu, cuda)
-    public_checks(gpu, cuda)
+    if not gpu.available():
+        if args.require_gpu:
+            raise SystemExit("FAIL: no CuPy or no CUDA device")
+        print("SKIP: no CuPy or no CUDA device")
+        return
+
+    direct_checks(gpu)
+    public_checks(gpu)
     print("PASS: GPU candmaker planes match their NumPy references")
 
 

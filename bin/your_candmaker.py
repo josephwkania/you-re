@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from your.candidate import Candidate, crop, set_median_threads
-from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop
+from your.utils.gpu import PinnedReadBuffer, gpu_dedisp_and_dmt_crop, gpu_errors
 from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
 logger = logging.getLogger()
@@ -267,9 +267,10 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         logger.debug(f"Using the GPU {gpu_id}")
         try:
             cand = gpu_dedisp_and_dmt_crop(cand, device=gpu_id)
-        except CudaAPIError:
+        except gpu_errors() as error:
             logger.info(
-                "Ran into a CudaAPIError, using the CPU version for this candidate"
+                f"Ran into a CUDA error ({error}), using the CPU version for this "
+                "candidate"
             )
             cand = cpu_dedisp_dmt(cand, args)
     else:
@@ -467,8 +468,6 @@ if __name__ == "__main__":
         logging.info("%s: %r", arg, value)
 
     if -1 not in values.gpu_id:
-        from numba.cuda.cudadrv.driver import CudaAPIError
-
         for gpu_ids in values.gpu_id:
             logger.info(f"Using the GPU {gpu_ids}")
         if len(values.gpu_id) > 1:
