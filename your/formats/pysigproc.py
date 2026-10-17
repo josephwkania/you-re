@@ -168,16 +168,17 @@ class SigprocFile(object):
     # See sigproc read_header.c
 
     @staticmethod
-    def get_string(fp):
+    def get_string(fp, max_chars=80):
         """
         Read the next sigproc-format string in the file.
 
         Args:
             fp: file object to read stuff from.
+            max_chars: longest string accepted
 
         """
         nchar = struct.unpack("i", fp.read(4))[0]
-        if nchar > 80 or nchar < 1:
+        if nchar > max_chars or nchar < 1:
             return None, 0
         out = fp.read(nchar)
         return out, nchar + 4
@@ -192,6 +193,7 @@ class SigprocFile(object):
         """
         if fp is not None:
             self.fp = fp
+        start = self.fp.tell()
         self.hdrbytes = 0
         (s, n) = self.get_string(self.fp)
         logging.debug(f"Reading {s} from the Filterbank file header.")
@@ -207,7 +209,8 @@ class SigprocFile(object):
                 self.hdrbytes += n
                 if s in self._type and n > 0:
                     if self._type[s] == "string":
-                        (v, n) = self.get_string(self.fp)
+                        # values such as rawdatafile can be long paths
+                        (v, n) = self.get_string(self.fp, max_chars=4096)
                         self.hdrbytes += n
                         setattr(self, s, v)
                     else:
@@ -217,6 +220,8 @@ class SigprocFile(object):
                         setattr(self, s, val)
                         self.hdrbytes += datasize
                 elif "HEADER_END" in s:
+                    # the file position counts any bytes skipped while recovering
+                    self.hdrbytes = self.fp.tell() - start
                     return
                 else:
                     logging.warning(
