@@ -249,6 +249,37 @@ def test_cand_watcher_reads_each_file_once_after_it_settles(tmp_path):
     assert len(watcher.poll(now=202.6)) == 3
 
 
+def test_cand_watcher_final_poll_reads_unsettled_files_once(tmp_path):
+    watcher = CandWatcher(str(tmp_path), settle=1.0)
+    (tmp_path / "a.cand").write_text(SNIPPET)
+    (tmp_path / "b.cand").write_text("")
+    watcher.poll(now=100.0)
+    got = watcher.poll(now=100.1, final=True)
+    assert len(got) == 3 and len(watcher.done) == 2
+    assert len(watcher.poll(now=200.0, final=True)) == 0
+
+
+def _your_heimdall():
+    spec = importlib.util.spec_from_file_location(
+        "your_heimdall", os.path.join(_install_dir, "../bin/your_heimdall.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_heimdall_done_is_written_once_and_only_for_a_candmaker(tmp_path):
+    tell = _your_heimdall().tell_candmaker_heimdall_is_done
+    done = tmp_path / "heimdall.done"
+    tell(None, str(done))
+    assert not done.exists()
+    tell(object(), str(done))
+    assert done.exists()
+    done.write_text("kept")
+    tell(object(), str(done))
+    assert done.read_text() == "kept"
+
+
 def _candmaker():
     spec = importlib.util.spec_from_file_location(
         "your_candmaker", os.path.join(_install_dir, "../bin/your_candmaker.py")
@@ -256,6 +287,26 @@ def _candmaker():
     candmaker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(candmaker)
     return candmaker
+
+
+def test_live_run_waits_for_a_slow_heimdall():
+    from types import SimpleNamespace
+
+    finished = _candmaker().live_finished
+    told = SimpleNamespace(heimdall_done="heimdall.done", end_wait=30.0)
+    untold = SimpleNamespace(heimdall_done=None, end_wait=30.0)
+    # the writer has finished but Heimdall has reported one gulp of four:
+    # a long quiet spell must not end the run when Heimdall will say it is done
+    state = dict(eod=True, reported=524288, written=2097152, idle=300.0)
+    assert not finished(told, finished=False, **state)
+    assert finished(told, finished=True, **state)
+    # without the done file only the quiet spell is left to go by
+    assert finished(untold, finished=False, **state)
+    assert not finished(untold, finished=False, **{**state, "idle": 10.0})
+    # ...or Heimdall's gulps covering every sample
+    covered = {**state, "reported": 2097152, "idle": 0.0}
+    assert finished(untold, finished=False, **covered)
+    assert not finished(untold, finished=False, **{**covered, "eod": False})
 
 
 def test_live_cuts():

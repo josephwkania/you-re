@@ -47,6 +47,16 @@ def run_in_own_group(run):
     run()
 
 
+def tell_candmaker_heimdall_is_done(candmaker, done_file):
+    """
+    Write `done_file`, the candmaker's sign that Heimdall has exited and
+    written every .cand file, if there is a candmaker and it is not written.
+    """
+    if candmaker is not None and not os.path.exists(done_file):
+        with open(done_file, "w"):
+            pass
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="your_heimdall.py",
@@ -120,6 +130,29 @@ if __name__ == "__main__":
         type=float,
         default=1.25,
     )
+    parser.add_argument(
+        "-nsamps_gulp",
+        "--nsamps_gulp",
+        help="samples Heimdall reads at a time; by default the next power of two "
+        "above the largest dispersion delay, and at least 2**18",
+        required=False,
+        type=int,
+        default=None,
+    )
+    for name, what in (
+        ("time", "samples"),
+        ("filter", "boxcar filters"),
+        ("dm_trial", "DM trials"),
+    ):
+        parser.add_argument(
+            f"-cand_sep_{name}",
+            f"--cand_sep_{name}",
+            help=f"{what} apart that Heimdall keeps candidates in separate "
+            "clusters; Heimdall's default if not given",
+            required=False,
+            type=int,
+            default=None,
+        )
     parser.add_argument(
         "-rfi_no_narrow",
         "--rfi_no_narrow",
@@ -257,7 +290,9 @@ if __name__ == "__main__":
     logging.info("Max Dispersion delay = %f s", max_delay)
     logging.info("Max Dispersion delay = %i samples", dispersion_delay_samples)
 
-    if your_object.your_header.nspectra < 2**18:
+    if values.nsamps_gulp is not None:
+        nsamps_gulp = min(values.nsamps_gulp, your_object.your_header.nspectra)
+    elif your_object.your_header.nspectra < 2**18:
         nsamps_gulp = your_object.your_header.nspectra
     else:
         nsamps_gulp = int(
@@ -326,6 +361,9 @@ if __name__ == "__main__":
         rfi_no_broad=values.rfi_no_broad,
         rfi_no_narrow=values.rfi_no_narrow,
         dm_tol=values.dm_tol,
+        cand_sep_time=values.cand_sep_time,
+        cand_sep_filter=values.cand_sep_filter,
+        cand_sep_dm_trial=values.cand_sep_dm_trial,
     )
 
     with open(
@@ -342,7 +380,12 @@ if __name__ == "__main__":
     heimdall_process = Process(name="Heimdall", target=run_in_own_group, args=(HM.run,))
 
     candmaker = None
+    # written once Heimdall has exited, so the candmaker need not wait to be
+    # sure no more .cand files are coming
+    heimdall_done = os.path.join(values.output_dir, "heimdall.done")
     if values.make_candidates:
+        if os.path.exists(heimdall_done):
+            os.remove(heimdall_done)
         latency = 3 * nsamps_gulp * your_object.your_header.tsamp + 30
         candmaker_cmd = [
             sys.executable,
@@ -361,6 +404,8 @@ if __name__ == "__main__":
             str(nsamps_gulp),
             "--max_boxcar",
             str(int(np.ceil(np.log2(max(HM.boxcar_max, 1))))),
+            "--heimdall_done",
+            heimdall_done,
             "-o",
             values.output_dir,
             *values.candmaker_args.split(),
@@ -383,11 +428,15 @@ if __name__ == "__main__":
             for process in (heimdall_process, dada_process):
                 if process.exitcode not in (None, 0):
                     raise RuntimeError(f"{process.name} exited with {process.exitcode}")
+            if heimdall_process.exitcode == 0:
+                tell_candmaker_heimdall_is_done(candmaker, heimdall_done)
             time.sleep(1)
         heimdall_process.join()
         dada_process.join()
         if candmaker is not None:
+            tell_candmaker_heimdall_is_done(candmaker, heimdall_done)
             candmaker.wait()
+            os.remove(heimdall_done)
     except (KeyboardInterrupt, RuntimeError) as error:
         logging.error("Stopping: %r", error)
         stopped = True

@@ -105,6 +105,24 @@ def test_heimdall_omits_false_boolean_flags(monkeypatch):
     assert "-rfi_no_broad" not in argv
 
 
+def test_heimdall_passes_candidate_separations_only_when_given(monkeypatch):
+    import your.utils.heimdall as heimdall
+
+    calls = _capture_runs(heimdall, monkeypatch)
+    heimdall.HeimdallManager(filename="in.fil").run()
+    heimdall.HeimdallManager(
+        filename="in.fil", cand_sep_time=128, cand_sep_filter=3, cand_sep_dm_trial=200
+    ).run()
+    plain, separated = calls[0][0], calls[1][0]
+    assert not any(arg.startswith("-cand_sep") for arg in plain)
+    for flag, value in (
+        ("-cand_sep_time", "128"),
+        ("-cand_sep_filter", "3"),
+        ("-cand_sep_dm_trial", "200"),
+    ):
+        assert separated[separated.index(flag) + 1] == value
+
+
 def test_dada_uses_checked_subprocess_commands(monkeypatch):
     dada, fake_writer = _load_dada_module(monkeypatch)
     calls = _capture_runs(dada, monkeypatch)

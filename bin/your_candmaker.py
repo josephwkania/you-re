@@ -386,6 +386,30 @@ def live_cuts(cands, values):
     return cands[keep]
 
 
+def live_finished(values, finished, eod, reported, written, idle):
+    """
+    Whether the live candmaker has every candidate Heimdall will report.
+
+    Args:
+        values: parsed arguments
+        finished (bool): the --heimdall_done file exists
+        eod (bool): the ring has ended
+        reported (int): samples Heimdall's .cand files cover so far
+        written (int): samples read from the ring
+        idle (float): seconds since the data ended with no new .cand file
+
+    Returns:
+        bool: True to stop
+    """
+    if finished:
+        return True
+    # told when Heimdall is done, wait for that: Heimdall can be many gulps
+    # behind the writer, so a quiet spell after the data end proves nothing
+    if not eod or values.heimdall_done:
+        return False
+    return reported >= written or idle > values.end_wait
+
+
 def live_main(values):
     """
     Make candidates from a psrdada ring as Heimdall reports them: read the
@@ -423,7 +447,12 @@ def live_main(values):
         _live_history.start(hold_timeout=values.hold_timeout)
         ending = None
         while True:
-            cands = watcher.poll()
+            # once Heimdall has exited every .cand file is whole and no more
+            # will come: take them all now rather than wait out end_wait
+            finished = bool(values.heimdall_done) and os.path.exists(
+                values.heimdall_done
+            )
+            cands = watcher.poll(final=finished)
             kept = live_cuts(cands, values)
             counts["cut"] += len(cands) - len(kept)
             for row in kept.itertuples():
@@ -454,19 +483,24 @@ def live_main(values):
                 # only now, once the reported gulps' candidates are pending,
                 # so their data cannot slip away in between.
                 reported = len(watcher.done) * values.heimdall_gulp
-                _live_history.hold_from = reported - reach
+                # with Heimdall done there are no unreported gulps to keep
+                _live_history.hold_from = None if finished else reported - reach
             for job in jobs:
                 if id(job) in _live_history.pending and job.ready():
                     del _live_history.pending[id(job)]
-            if _live_history.eod:
-                # Heimdall's last files land after the data end; stop once
-                # nothing new has settled for a while
-                if not len(cands):
-                    ending = ending or time.time()
-                    if time.time() - ending > values.end_wait:
-                        break
-                else:
-                    ending = None
+            if len(cands) or not _live_history.eod:
+                ending = None
+            else:
+                ending = ending or time.time()
+            if live_finished(
+                values,
+                finished=finished,
+                eod=_live_history.eod,
+                reported=len(watcher.done) * values.heimdall_gulp,
+                written=_live_history.written,
+                idle=0.0 if ending is None else time.time() - ending,
+            ):
+                break
             time.sleep(values.poll)
         for job in jobs:
             status, _, _ = job.get()
@@ -632,12 +666,22 @@ if __name__ == "__main__":
     )
     live.add_argument(
         "--end_wait",
-        help="seconds to keep watching for .cand files after the data end",
+        help="without --heimdall_done: seconds after the data end with no new "
+        ".cand file before stopping, unless Heimdall's gulps already cover every "
+        "sample; must be longer than Heimdall takes over a gulp",
         type=float,
         default=30.0,
     )
     live.add_argument(
         "--poll", help="seconds between looks for .cand files", type=float, default=0.5
+    )
+    live.add_argument(
+        "--heimdall_done",
+        help="file whose appearance means Heimdall has exited and written all "
+        "its .cand files: the candmaker then makes the rest and stops without "
+        "waiting --end_wait (your_heimdall.py --make_candidates writes it)",
+        type=str,
+        default=None,
     )
     live.add_argument(
         "--heimdall_gulp",

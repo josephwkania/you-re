@@ -93,6 +93,9 @@ class HeimdallManager:
         boxcar_max (int): maximum boxcar width in samples
         fswap (bool): swap channel ordering for negative DM - SIGPROC 2,4 or 8 bit only
         min_tscrunch_width: vary between high quality (large value) and high performance (low value)
+        cand_sep_time (int): samples apart that candidates stay separate clusters
+        cand_sep_filter (int): boxcar filters apart that candidates stay separate
+        cand_sep_dm_trial (int): DM trials apart that candidates stay separate
 
     """
 
@@ -118,6 +121,9 @@ class HeimdallManager:
         boxcar_max=4096,
         fswap=None,
         min_tscrunch_width=None,
+        cand_sep_time=None,
+        cand_sep_filter=None,
+        cand_sep_dm_trial=None,
     ):
         self.k = dada_key
         self.f = filename
@@ -139,6 +145,10 @@ class HeimdallManager:
         self.boxcar_max = boxcar_max
         self.fswap = fswap
         self.min_tscrunch_width = min_tscrunch_width
+        # Heimdall reads these but leaves them out of its -h text
+        self.cand_sep_time = cand_sep_time
+        self.cand_sep_filter = cand_sep_filter
+        self.cand_sep_dm_trial = cand_sep_dm_trial
 
         if (self.k is None) and (self.f is None):
             raise IOError("Need either a dada key or a filterbank file to run")
@@ -171,6 +181,9 @@ class HeimdallManager:
             "boxcar_max",
             "fswap",
             "min_tscrunch_width",
+            "cand_sep_time",
+            "cand_sep_filter",
+            "cand_sep_dm_trial",
         ):
             value = getattr(self, attribute)
             if value is None:
@@ -238,12 +251,14 @@ class CandWatcher:
         self.done = set()
         self._seen = {}
 
-    def poll(self, now=None):
+    def poll(self, now=None, final=False):
         """
         Candidates from the files that have settled since the last call.
 
         Args:
             now (float): time to judge settling by; time.time() if None
+            final (bool): Heimdall has exited, so every file is whole: read
+                all those not read yet, settled or not
 
         Returns:
             pandas.DataFrame: their candidates, with a `file` column
@@ -258,13 +273,14 @@ class CandWatcher:
             except FileNotFoundError:
                 continue
             state = (stat.st_size, stat.st_mtime)
-            if self._seen.get(path, (None, None))[0] != state:
-                self._seen[path] = (state, now)
-                continue
-            if now - self._seen[path][1] < self.settle:
-                continue
+            if not final:
+                if self._seen.get(path, (None, None))[0] != state:
+                    self._seen[path] = (state, now)
+                    continue
+                if now - self._seen[path][1] < self.settle:
+                    continue
             self.done.add(path)
-            del self._seen[path]
+            self._seen.pop(path, None)
             frame = read_cand_file(path)
             frame["file"] = path
             frames.append(frame)
