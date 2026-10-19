@@ -27,6 +27,7 @@ class DadaManager:
         self.size = size
         self.key = key
         self.n_readers = n_readers
+        self.torn_down = False
         # cast dictionary based on https://docs.python.org/3/library/struct.html#format-characters
         self.cast_dict = {"uint8": "B", "uint16": "H", "int16": "h", "float32": "f"}
 
@@ -101,15 +102,18 @@ class DadaManager:
 
     def teardown(self, disconnect=True):
         """
-        Disconnect the writer and tear down the buffers.
+        Disconnect the writer and tear down the buffers, once.
 
         Args:
             disconnect (bool): disconnect the writer first; False after a
                 reader has died, when disconnecting would wait on it for good
         """
+        if self.torn_down:
+            return
         if disconnect:
             self.writer.disconnect()
         subprocess.run(["dada_db", "-d", "-k", str(self.key)], check=True)
+        self.torn_down = True
 
     def __enter__(self):
         return self.setup()

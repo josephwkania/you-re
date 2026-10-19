@@ -4,6 +4,7 @@ CLI to run Heimdall on fits or fils using Your.
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
@@ -38,13 +39,40 @@ def page_samples(gulp, most):
     return best
 
 
+def with_default_sigterm(run):
+    """
+    Call `run` with SIGTERM's default action, in a process forked after
+    `stop_on_sigterm`, so that SIGTERM stops it at once, even while it waits
+    inside psrdada.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    run()
+
+
 def run_in_own_group(run):
     """
     Call `run` as the leader of a new process group, so that stopping the
     group also stops any program it started, such as heimdall.
     """
     os.setpgrp()
-    run()
+    with_default_sigterm(run)
+
+
+def stop_on_sigterm(main_pid):
+    """
+    Make SIGTERM, as sent by kill or scancel, raise KeyboardInterrupt in this
+    process, so it stops through the same clean-up as Ctrl-C. A process forked
+    from it gets SIGTERM's default action, also before `with_default_sigterm`.
+    """
+
+    def handler(signum, frame):
+        if os.getpid() != main_pid:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, handler)
 
 
 def tell_candmaker_heimdall_is_done(candmaker, done_file):
@@ -315,6 +343,7 @@ if __name__ == "__main__":
         savgol_frequency_window=values.savgol_frequency_window,
         flag_rfi=values.flag_rfi,
     )
+    stop_on_sigterm(os.getpid())
     if values.make_candidates:
         # pages a quarter of Heimdall's gulp, so the writer can run at most
         # the ring's 8 pages, two gulps, ahead of Heimdall, and the
@@ -324,6 +353,9 @@ if __name__ == "__main__":
     else:
         # need to run the set up inorder to get the dada key
         your_dada_writer.setup_dada()
+    # destroys the ring if the script ends before its own teardown below, for
+    # example on an error or a SIGTERM before Heimdall starts
+    atexit.register(your_dada_writer.DM.teardown, disconnect=False)
 
     if values.mask:
         logging.info("Reading RFI mask from %s", values.mask)
@@ -376,7 +408,9 @@ if __name__ == "__main__":
     ) as fp:
         json.dump(HM.__dict__, fp, cls=MyEncoder, indent=4)
 
-    dada_process = Process(name="To dada", target=your_dada_writer.to_dada)
+    dada_process = Process(
+        name="To dada", target=with_default_sigterm, args=(your_dada_writer.to_dada,)
+    )
     heimdall_process = Process(name="Heimdall", target=run_in_own_group, args=(HM.run,))
 
     candmaker = None

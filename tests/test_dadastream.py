@@ -1,5 +1,8 @@
 import importlib.util
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -278,6 +281,40 @@ def test_heimdall_done_is_written_once_and_only_for_a_candmaker(tmp_path):
     done.write_text("kept")
     tell(object(), str(done))
     assert done.read_text() == "kept"
+
+
+def test_sigterm_stops_your_heimdall_like_ctrl_c_but_not_its_children():
+    # the children wait in a pipe read, as the writer waits inside psrdada,
+    # where a Python handler would not run
+    script = f"""
+import importlib.util, multiprocessing, os, signal, time
+spec = importlib.util.spec_from_file_location("h", {os.path.join(_install_dir, "../bin/your_heimdall.py")!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.stop_on_sigterm(os.getpid())
+fork = multiprocessing.get_context("fork")
+for wrap in (module.with_default_sigterm, module.run_in_own_group):
+    started, never = fork.Event(), os.pipe()
+    child = fork.Process(target=wrap, args=(lambda: started.set() or os.read(never[0], 1),))
+    child.start()
+    started.wait()
+    os.kill(child.pid, signal.SIGTERM)
+    child.join(20)
+    print(wrap.__name__, child.exitcode)
+try:
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(20)
+except KeyboardInterrupt as error:
+    print("stopped", error)
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+    )
+    assert out.stdout.splitlines() == [
+        f"with_default_sigterm {-signal.SIGTERM}",
+        f"run_in_own_group {-signal.SIGTERM}",
+        "stopped SIGTERM",
+    ], out.stderr
 
 
 def _candmaker():
