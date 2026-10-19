@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import functools
 import json
 import logging
 import os
@@ -367,6 +368,25 @@ class Your(PsrfitsFile, SigprocFile):
         )
 
 
+# a candmaker makes a header per candidate, all from the same few files;
+# astropy took several milliseconds over each of these
+@functools.lru_cache(maxsize=64)
+def _galactic(ra_deg, dec_deg):
+    """Galactic longitude less 180 and latitude, degrees."""
+    from astropy.coordinates import SkyCoord
+
+    loc = SkyCoord(ra_deg, dec_deg, unit="deg").galactic
+    return loc.l.value - 180, loc.b.value
+
+
+@functools.lru_cache(maxsize=64)
+def _utc_isot(tstart):
+    """MJD `tstart` as a UTC ISO time string."""
+    from astropy.time import Time
+
+    return Time(tstart, format="mjd").utc.isot
+
+
 class Header:
     # TODO: add nbeams, ibeam, data_type, az_start, za_start, telescope, backend
     """
@@ -455,21 +475,14 @@ class Header:
         self.npol = your.nifs
         self.poln_order = your.poln_order
         self.tstart = your.tstart
-        from astropy.coordinates import SkyCoord
-
         if self.ra_deg and self.dec_deg:
-            loc = SkyCoord(self.ra_deg, self.dec_deg, unit="deg")
-            self.gl = loc.galactic.l.value - 180
-            self.gb = loc.galactic.b.value
+            self.gl, self.gb = _galactic(self.ra_deg, self.dec_deg)
         else:
             # for 174 bit header Filterbank
             self.gl = None
             self.gb = None
 
-        from astropy.time import Time
-
-        ts = Time(your.tstart, format="mjd")
-        self.tstart_utc = ts.utc.isot
+        self.tstart_utc = _utc_isot(your.tstart)
 
         logger.debug(f"Successfully generated unified header for file {self.filename}")
 
