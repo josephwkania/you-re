@@ -417,6 +417,29 @@ def live_cuts(cands, values):
     return cands[keep]
 
 
+def live_hand_out(waiting, history, submit):
+    """
+    Submit the waiting candidates whose samples have all been read, in order.
+    Workers never wait for data: were every worker waiting on samples the
+    reader has not taken, none would make the candidates the reader holds the
+    ring for, and the ring would stall until the hold timed out.
+
+    Args:
+        waiting (list): (key, cand_val, stop) of candidates not yet submitted;
+            those submitted are removed
+        history (DadaHistory): the history
+        submit (callable): submits a cand_val, returning its AsyncResult
+
+    Returns:
+        list: (key, AsyncResult) of the candidates submitted
+    """
+    eod = history.eod
+    written = history.written
+    ready = [entry for entry in waiting if eod or entry[2] <= written]
+    waiting[:] = [entry for entry in waiting if not (eod or entry[2] <= written)]
+    return [(key, submit(cand_val)) for key, cand_val, _ in ready]
+
+
 def live_finished(values, finished, eod, reported, written, idle):
     """
     Whether the live candmaker has every candidate Heimdall will report.
@@ -467,6 +490,7 @@ def live_main(values):
     probe._reset_candidate(dm=values.max_dm, tcand=tfar, width=widest)
     reach = int(tfar / tsamp) - probe.chunk_bounds()[0] + 1
     watcher = CandWatcher(values.cand_dir, settle=values.settle)
+    waiting = []
     jobs = []
     counts = {"cut": 0, "made": 0, "lost": 0, "failed": 0}
     # fork, so the workers share the history's memory; the reader thread
@@ -478,6 +502,10 @@ def live_main(values):
         initargs=(values.gpu_id, context.Value("i", 0)),
     ) as pool:
         _live_history.start(hold_timeout=values.hold_timeout)
+
+        def submit(cand_val):
+            return pool.apply_async(live_cand2h5, (cand_val,))
+
         ending = None
         while True:
             # once Heimdall has exited every .cand file is whole and no more
@@ -506,11 +534,11 @@ def live_main(values):
                     # each worker puts it on its own GPU
                     values.gpu_id[0],
                 ]
-                job = pool.apply_async(live_cand2h5, (cand_val,))
-                jobs.append(job)
+                key = len(jobs) + len(waiting)
+                waiting.append((key, cand_val, first + nsamp))
                 if not values.drop_when_behind:
                     # hold the ring for it once its data are in
-                    _live_history.pending[id(job)] = (max(0, first), first + nsamp)
+                    _live_history.pending[key] = (max(0, first), first + nsamp)
             if not values.drop_when_behind:
                 # Heimdall writes one .cand file per gulp, in order: keep what
                 # the candidates of gulps not yet reported may need. Raised
@@ -519,9 +547,10 @@ def live_main(values):
                 reported = len(watcher.done) * values.heimdall_gulp
                 # with Heimdall done there are no unreported gulps to keep
                 _live_history.hold_from = None if finished else reported - reach
-            for job in jobs:
-                if id(job) in _live_history.pending and job.ready():
-                    del _live_history.pending[id(job)]
+            jobs += live_hand_out(waiting, _live_history, submit)
+            for key, job in jobs:
+                if key in _live_history.pending and job.ready():
+                    del _live_history.pending[key]
             if len(cands) or not _live_history.eod:
                 ending = None
             else:
@@ -536,7 +565,13 @@ def live_main(values):
             ):
                 break
             time.sleep(values.poll)
-        for job in jobs:
+        while waiting:
+            jobs += live_hand_out(waiting, _live_history, submit)
+            for key, job in jobs:
+                if key in _live_history.pending and job.ready():
+                    del _live_history.pending[key]
+            time.sleep(values.poll)
+        for _, job in jobs:
             status, _, _ = job.get()
             counts[status] += 1
     logging.info(

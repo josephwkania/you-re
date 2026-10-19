@@ -425,6 +425,57 @@ def test_live_candidate_that_fails_releases_gpu_memory(monkeypatch, error, statu
     assert released == [0, 3]
 
 
+def test_live_hand_out_submits_candidates_once_their_data_are_in():
+    hand_out = _candmaker().live_hand_out
+    history = DadaHistory(_header(), capacity=12)
+    history.add_page(_filled(history, 0, 6).tobytes())
+    waiting = [(0, "a", 4), (1, "b", 9), (2, "c", 6)]
+    submitted = hand_out(waiting, history, str.upper)
+    assert submitted == [(0, "A"), (2, "C")]
+    assert waiting == [(1, "b", 9)]
+    history.mark_end()
+    assert hand_out(waiting, history, str.upper) == [(1, "B")]
+    assert waiting == []
+
+
+def test_live_hand_out_keeps_a_held_ring_moving():
+    from concurrent.futures import ThreadPoolExecutor
+
+    hand_out = _candmaker().live_hand_out
+    history = DadaHistory(_header(), capacity=9)
+    pages = [_filled(history, s, 3).tobytes() for s in range(0, 18, 3)]
+    history.reader = FakeReader(pages)
+    # x, reported first, needs samples up to 12; y's samples 1..4 make the
+    # ring hold at 6. Were x handed to the one worker, it would wait for
+    # samples the held ring never brings, and y would never be made.
+    waiting = [(0, ("x", 12), 12), (1, ("y", 4), 4)]
+    history.pending.update({0: (0, 12), 1: (1, 4)})
+    made = []
+
+    def make(name, stop):
+        history.wait_for(stop)
+        made.append(name)
+
+    jobs = []
+    thread = history.start()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            deadline = time.time() + 5
+            while waiting or not all(job.done() for _, job in jobs):
+                assert time.time() < deadline, f"stalled after {made}"
+                jobs += hand_out(waiting, history, lambda val: pool.submit(make, *val))
+                for key, job in jobs:
+                    if key in history.pending and job.done():
+                        del history.pending[key]
+                time.sleep(0.001)
+        finally:
+            # let a stalled ring go, so a stuck worker and the test can end
+            history.pending.clear()
+    thread.join(5)
+    assert made == ["y", "x"]
+    assert history.written == 18 and history.eod
+
+
 def test_workers_take_the_gpus_in_turn():
     import multiprocessing
 
