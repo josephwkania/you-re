@@ -18,7 +18,7 @@ os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 import textwrap
 import time
 from datetime import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool, Value
 from multiprocessing.util import Finalize
 
 import numpy as np
@@ -29,9 +29,11 @@ from your.formats.dadastream import Overwritten, wait_for_chunk
 from your.utils.gpu import (
     PinnedReadBuffer,
     check_compiler,
+    check_devices,
     gpu_dedisp_and_dmt_crop,
     gpu_errors,
     release_memory,
+    use_device,
 )
 from your.utils.misc import ReadBuffer, YourArgparseFormatter
 
@@ -44,6 +46,8 @@ _worker_candidate_finalizer = None
 _read_buffer = None
 # this process's reused read buffer for the CPU path
 _cpu_read_buffer = None
+# the GPU this worker makes all its candidates on, None on the CPU
+_worker_gpu = None
 
 
 def cpu_dedisp_dmt(cand, args):
@@ -186,8 +190,22 @@ def _clear_worker_candidate():
     _worker_candidate_key = None
 
 
-def _init_cand_worker():
-    global _worker_candidate_finalizer
+def _init_cand_worker(gpu_ids=None, started=None):
+    """
+    Set up a candmaker worker. With GPUs, each worker takes the next of them
+    in turn and makes all its candidates there, so it holds a CUDA context,
+    compiled kernels and memory pool on one GPU instead of on every one.
+
+    Args:
+        gpu_ids (list): GPU IDs to share among the workers
+        started (multiprocessing.Value): workers started so far
+    """
+    global _worker_candidate_finalizer, _worker_gpu
+    if gpu_ids is not None and -1 not in gpu_ids:
+        with started.get_lock():
+            _worker_gpu = gpu_ids[started.value % len(gpu_ids)]
+            started.value += 1
+        logger.debug(f"Worker on GPU {_worker_gpu}")
     _clear_worker_candidate()
     _worker_candidate_finalizer = Finalize(
         None, _clear_worker_candidate, exitpriority=10
@@ -251,6 +269,9 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         kill_mask[kill_chans] = True
         cand.kill_mask = kill_mask
     if gpu_id >= 0:
+        # current, so the GPU code's device blocks need not switch back to
+        # GPU 0 afterwards, which would make a context there too
+        use_device(gpu_id)
         # this worker makes one candidate at a time, so every chunk can be
         # read into the same page-locked buffer and uploaded from there, to
         # whichever GPU the candidate goes to
@@ -289,7 +310,7 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
         if gpu_failed:
             # the failed attempt's arrays are free only now the exception is
             # gone; hand their memory back before the CPU takes over
-            release_memory()
+            release_memory(gpu_id)
             cand = cpu_dedisp_dmt(cand, args)
     else:
         cand = cpu_dedisp_dmt(cand, args)
@@ -314,9 +335,17 @@ def _cand2h5(cand_val, *, candidate=None, files=None):
     return fout
 
 
+def _on_worker_gpu(cand_val):
+    """The candidate's parameters, sent to this worker's GPU if it has one."""
+    if _worker_gpu is None:
+        return cand_val
+    return [*cand_val[:9], _worker_gpu]
+
+
 def cached_cand2h5(cand_val):
     """Reuse one FITS Candidate within each serial Pool worker."""
     global _worker_candidate, _worker_candidate_key
+    cand_val = _on_worker_gpu(cand_val)
     try:
         files = _input_files(cand_val[0], cand_val[7])
         if os.path.splitext(cand_val[0])[1] not in (".fits", ".sf"):
@@ -347,6 +376,7 @@ def live_cand2h5(cand_val):
         "made", "lost" (its data had left the history) or "failed"
     """
     start = time.time()
+    cand_val = _on_worker_gpu(cand_val)
     try:
         fout = _cand2h5(cand_val, files=_live_history)
     except Overwritten as error:
@@ -360,7 +390,8 @@ def live_cand2h5(cand_val):
         return "made", fout, time.time() - start
     # a candidate that failed on the GPU leaves its memory in CuPy's pool,
     # which Heimdall, on the same GPU, may need
-    release_memory()
+    if cand_val[9] >= 0:
+        release_memory(cand_val[9])
     return *result, time.time() - start
 
 
@@ -418,7 +449,6 @@ def live_main(values):
     """
     global _live_history
     import multiprocessing
-    from itertools import cycle
 
     from your.formats.dadastream import DadaHistory
     from your.utils.heimdall import CandWatcher
@@ -426,7 +456,6 @@ def live_main(values):
     _live_history = DadaHistory.connect(
         values.dada_key, max_dm=values.max_dm, latency=values.latency
     )
-    gpu_ids = cycle(values.gpu_id)
     kill_mask_path = values.kill_mask or ""
     # one candidate kept only to work out each candidate's samples
     probe = Candidate(_live_history, dm=1.0)
@@ -443,7 +472,11 @@ def live_main(values):
     # fork, so the workers share the history's memory; the reader thread
     # starts after, in this process only
     context = multiprocessing.get_context("fork")
-    with context.Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
+    with context.Pool(
+        processes=values.nproc,
+        initializer=_init_cand_worker,
+        initargs=(values.gpu_id, context.Value("i", 0)),
+    ) as pool:
         _live_history.start(hold_timeout=values.hold_timeout)
         ending = None
         while True:
@@ -470,7 +503,8 @@ def live_main(values):
                     kill_mask_path,
                     1,
                     values,
-                    next(gpu_ids),
+                    # each worker puts it on its own GPU
+                    values.gpu_id[0],
                 ]
                 job = pool.apply_async(live_cand2h5, (cand_val,))
                 jobs.append(job)
@@ -547,7 +581,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-g",
         "--gpu_id",
-        help="GPU ID (use -1 for CPU). To use multiple GPUs (say with id 2 and 3 use -g 2 3",
+        help="GPU ID (use -1 for CPU). To use multiple GPUs (say with id 2 and 3 "
+        "use -g 2 3; the workers (-n) take them in turn, so give at least one "
+        "per GPU)",
         nargs="+",
         required=False,
         default=[-1],
@@ -712,6 +748,8 @@ if __name__ == "__main__":
         values.cand_dir is None or values.max_dm is None
     ):
         parser.error("--dada_key needs --cand_dir and --max_dm")
+    if -1 in values.gpu_id and len(values.gpu_id) > 1:
+        parser.error("-g -1 (the CPU) cannot be mixed with GPU IDs")
 
     logging_format = (
         "%(asctime)s - %(funcName)s -%(name)s - %(levelname)s - %(message)s"
@@ -752,15 +790,21 @@ if __name__ == "__main__":
         logging.info("%s: %r", arg, value)
 
     if -1 not in values.gpu_id:
-        # every candidate would fail without the kernel compiler; say so once,
-        # before any worker forks
+        # every candidate would fail without the kernel compiler or the GPU,
+        # each falling back to the CPU; say so once, before any worker forks
         check_compiler()
+        try:
+            check_devices(values.gpu_id)
+        except ValueError as error:
+            parser.error(str(error))
         for gpu_ids in values.gpu_id:
             logger.info(f"Using the GPU {gpu_ids}")
-        if len(values.gpu_id) > 1:
-            from itertools import cycle
-
-            gpu_id_cycler = cycle(range(len(values.gpu_id)))
+        if values.nproc < len(set(values.gpu_id)):
+            logger.warning(
+                f"{values.nproc} worker(s) for {len(set(values.gpu_id))} GPUs: "
+                f"only GPU {', '.join(map(str, sorted(set(values.gpu_id[: values.nproc]))))} "
+                "will be used; raise -n"
+            )
     else:
         logger.info("Using CPUs only")
 
@@ -773,12 +817,9 @@ if __name__ == "__main__":
     # Else they will clog the GPU memory at once
     cand_pars.sample(frac=1).reset_index(drop=True)
     process_list = []
+    # each worker puts its candidates on its own GPU
+    gpu_id = values.gpu_id[0]
     for index, row in cand_pars.iterrows():
-        if len(values.gpu_id) > 1:
-            # If there are more than one GPUs cycle the candidates between them.
-            gpu_id = next(gpu_id_cycler)
-        else:
-            gpu_id = values.gpu_id[0]
         process_list.append(
             [
                 row["file"],
@@ -794,5 +835,9 @@ if __name__ == "__main__":
             ]
         )
 
-    with Pool(processes=values.nproc, initializer=_init_cand_worker) as pool:
+    with Pool(
+        processes=values.nproc,
+        initializer=_init_cand_worker,
+        initargs=(values.gpu_id, Value("i", 0)),
+    ) as pool:
         pool.map(cached_cand2h5, process_list, chunksize=1)

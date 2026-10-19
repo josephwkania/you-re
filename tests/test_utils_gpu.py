@@ -337,3 +337,122 @@ def test_release_memory_needs_no_cupy(monkeypatch):
     monkeypatch.setitem(sys.modules, "cupy", fake)
     gpu.release_memory()
     assert freed == [True]
+
+
+def test_release_memory_empties_the_given_device(monkeypatch):
+    """The pool frees only the current device's memory, so enter the GPU."""
+    current = [0]
+    freed = []
+
+    class Device:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            current.append(self.device)
+
+        def __exit__(self, *exc):
+            current.pop()
+
+    pool = types.SimpleNamespace(free_all_blocks=lambda: freed.append(current[-1]))
+    fake = types.SimpleNamespace(
+        get_default_memory_pool=lambda: pool, cuda=types.SimpleNamespace(Device=Device)
+    )
+    monkeypatch.setitem(sys.modules, "cupy", fake)
+    gpu.release_memory(1)
+    gpu.release_memory()
+    assert freed == [1, 0]
+
+    def broken(device):
+        raise RuntimeError("illegal address")
+
+    fake.cuda.Device = broken
+    gpu.release_memory(1)
+
+
+@pytest.mark.skipif(gpu.device_count() < 2, reason="requires two GPUs")
+def test_release_memory_frees_a_second_gpu():
+    import cupy
+
+    pool = cupy.get_default_memory_pool()
+    with cupy.cuda.Device(1):
+        x = cupy.zeros(2**24, dtype=np.uint8)
+        del x
+        assert pool.total_bytes() > 0
+    gpu.release_memory()
+    with cupy.cuda.Device(1):
+        kept = pool.total_bytes()
+    gpu.release_memory(1)
+    with cupy.cuda.Device(1):
+        assert pool.total_bytes() == 0
+    # without the device, the pool empties only GPU 0's arena
+    assert kept > 0
+
+
+# made in a fresh process: whether candidates on GPU 1 leave a context on GPU 0
+_CONTEXT_ON_GPU0 = """
+import ctypes, os, sys
+from your.candidate import Candidate
+from your.utils.gpu import gpu_dedisp_and_dmt_crop, use_device
+
+use_device(1)
+cand = Candidate(fp=sys.argv[1], dm=475.284, tcand=2.02888, width=32, label=-1,
+                 snr=16.8128, min_samp=256, device=1)
+cand.get_chunk()
+gpu_dedisp_and_dmt_crop(cand, device=1)
+cuda = ctypes.CDLL("libcuda.so.1")
+device, flags, active = ctypes.c_int(), ctypes.c_uint(), ctypes.c_int()
+assert cuda.cuDeviceGet(ctypes.byref(device), 0) == 0
+state = cuda.cuDevicePrimaryCtxGetState
+assert state(device, ctypes.byref(flags), ctypes.byref(active)) == 0
+print(active.value)
+"""
+
+
+@pytest.mark.skipif(gpu.device_count() < 2, reason="requires two GPUs")
+def test_candidates_on_gpu1_leave_gpu0_alone():
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CONTEXT_ON_GPU0,
+            os.path.join(_install_dir, "data/28.fil"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0"
+
+
+def test_check_devices(monkeypatch):
+    def run(stdout, stderr=""):
+        result = types.SimpleNamespace(stdout=stdout, stderr=stderr)
+        monkeypatch.setattr(gpu.subprocess, "run", lambda *a, **k: result)
+
+    run("2\n")
+    gpu.check_devices([0, 1])
+    with pytest.raises(ValueError, match="No GPU 2, 3: CuPy sees 2"):
+        gpu.check_devices([1, 2, 3])
+    run("", "cudaErrorNoDevice: no CUDA-capable device is detected\n")
+    with pytest.raises(ValueError, match="sees 0 device.*no CUDA-capable"):
+        gpu.check_devices([0])
+
+
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
+def test_check_devices_counts_the_real_gpus():
+    gpu.check_devices(list(range(gpu.device_count())))
+    with pytest.raises(ValueError):
+        gpu.check_devices([gpu.device_count()])
+
+
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
+def test_get_gpu_memory_map():
+    import cupy
+
+    for device in range(gpu.device_count()):
+        with cupy.cuda.Device(device):
+            total = cupy.cuda.runtime.memGetInfo()[1]
+        assert 0 < gpu.get_gpu_memory_map(device) <= total // 2**20

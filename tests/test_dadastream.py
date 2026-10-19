@@ -411,9 +411,47 @@ def test_live_candidate_that_fails_releases_gpu_memory(monkeypatch, error, statu
 
     released = []
     monkeypatch.setattr(candmaker, "_cand2h5", fail)
-    monkeypatch.setattr(candmaker, "release_memory", lambda: released.append(True))
+    monkeypatch.setattr(candmaker, "release_memory", released.append)
     cand_val = ["dada", 9.0, 4, 70.0, -1, 1.5, "", 1, None, 0]
     result, reason, seconds = candmaker.live_cand2h5(cand_val)
     assert result == status and reason
     assert seconds >= 0
-    assert released == [True]
+    assert released == [0]
+    # on its worker's GPU, released there; nothing to release on the CPU
+    monkeypatch.setattr(candmaker, "_worker_gpu", 3)
+    candmaker.live_cand2h5(cand_val)
+    monkeypatch.setattr(candmaker, "_worker_gpu", None)
+    candmaker.live_cand2h5(cand_val[:9] + [-1])
+    assert released == [0, 3]
+
+
+def test_workers_take_the_gpus_in_turn():
+    import multiprocessing
+
+    candmaker = _candmaker()
+    started = multiprocessing.Value("i", 0)
+    gpus = []
+    for _ in range(5):
+        candmaker._init_cand_worker([2, 5], started)
+        gpus.append(candmaker._worker_gpu)
+    assert gpus == [2, 5, 2, 5, 2]
+    cand_val = ["f.fil", 9.0, 4, 70.0, -1, 1.5, "", 1, None, 2]
+    assert candmaker._on_worker_gpu(cand_val)[9] == 2
+    assert candmaker._on_worker_gpu(cand_val)[:9] == cand_val[:9]
+
+    candmaker = _candmaker()
+    candmaker._init_cand_worker([-1], multiprocessing.Value("i", 0))
+    assert candmaker._worker_gpu is None
+    assert candmaker._on_worker_gpu(cand_val) is cand_val
+
+
+def test_each_worker_uses_its_own_gpu(monkeypatch):
+    """A worker sends every candidate to its GPU, whatever the list says."""
+    candmaker = _candmaker()
+    seen = []
+    monkeypatch.setattr(
+        candmaker, "_cand2h5", lambda cand_val, files=None: seen.append(cand_val[9])
+    )
+    monkeypatch.setattr(candmaker, "_worker_gpu", 1)
+    candmaker.cached_cand2h5(["x.fil", 9.0, 4, 70.0, -1, 1.5, "", 1, None, 0])
+    assert seen == [1]

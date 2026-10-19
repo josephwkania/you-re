@@ -50,6 +50,44 @@ def device_count():
         return 0
 
 
+def check_devices(device_ids):
+    """
+    Check every GPU ID names a CUDA device, counting the devices in a child
+    process: counting them here would start CUDA in this one, and workers
+    forked from it afterwards could not use the GPU.
+
+    Args:
+        device_ids (list): GPU IDs, as CUDA numbers them (so within
+            CUDA_VISIBLE_DEVICES)
+
+    Raises:
+        ValueError: an ID is not a device
+    """
+    import sys
+
+    count = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cupy; print(cupy.cuda.runtime.getDeviceCount())",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        why = ""
+        count = int(count.stdout)
+    except ValueError:
+        why = f" ({(count.stderr.strip().splitlines() or ['no output'])[-1]})"
+        count = 0
+    missing = [i for i in device_ids if not 0 <= i < count]
+    if missing:
+        raise ValueError(
+            f"No GPU {', '.join(map(str, missing))}: CuPy sees {count} "
+            f"device(s){why}, numbered from 0 within CUDA_VISIBLE_DEVICES"
+        )
+
+
 def check_compiler():
     """
     Load NVRTC, which compiles the kernels, without making a CUDA context, so
@@ -68,15 +106,42 @@ def check_compiler():
         ) from error
 
 
-def release_memory():
+def use_device(device):
+    """
+    Make `device` this thread's current GPU. CuPy's `with Device(n)` blocks
+    switch back to the previous device as they end, and since CUDA 12
+    switching to a device makes a context there: a process working on GPU 1
+    that never made it current would hold a context on GPU 0 as well.
+
+    Args:
+        device (int): GPU ID
+    """
+    _cupy().cuda.Device(device).use()
+
+
+def release_memory(device=None):
     """
     Return the memory CuPy's pool keeps to the device, as after a candidate
     that failed part way. Does nothing if CuPy was never imported.
+
+    Args:
+        device (int): GPU whose pool to empty; the pool frees only the
+            current device's memory, and the default is the current device
     """
     import sys
 
-    if "cupy" in sys.modules:
-        sys.modules["cupy"].get_default_memory_pool().free_all_blocks()
+    if "cupy" not in sys.modules:
+        return
+    cupy = sys.modules["cupy"]
+    try:
+        if device is None:
+            cupy.get_default_memory_pool().free_all_blocks()
+        else:
+            with cupy.cuda.Device(device):
+                cupy.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        # a device that has failed may refuse even this
+        logger.debug(f"Could not release GPU {device}'s memory", exc_info=True)
 
 
 def gpu_errors():
@@ -949,17 +1014,13 @@ def get_gpu_memory_map(gpu_id):
     Get the current gpu free memory
 
     Args:
-        gpu_id (int): GPU id
+        gpu_id (int): GPU id, as CUDA numbers them (nvidia-smi's numbers can
+            differ, and ignore CUDA_VISIBLE_DEVICES)
 
     Returns:
-        int: amount of free GPU RAM
+        int: free GPU RAM in MiB
     """
-    cmd_list = [
-        "nvidia-smi",
-        "-i",
-        f"{gpu_id}",
-        "--query-gpu=memory.free",
-        "--format=csv,nounits,noheader",
-    ]
-    result = subprocess.check_output(cmd_list)
-    return int(result.decode())
+    cupy = _cupy()
+    with cupy.cuda.Device(gpu_id):
+        free, _ = cupy.cuda.runtime.memGetInfo()
+    return free // 2**20
