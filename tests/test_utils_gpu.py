@@ -427,6 +427,56 @@ def test_candidates_on_gpu1_leave_gpu0_alone():
     assert result.stdout.strip() == "0"
 
 
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
+@pytest.mark.parametrize("dm", [0.0, 3.3, 47.6854, 475.284, 2000.0])
+@pytest.mark.parametrize("foff", [-0.0732421875, 0.25])
+def test_device_dmt_delays_match_the_host(dm, foff):
+    nchans, nsamples = 4096, 20011
+    cand = types.SimpleNamespace(
+        dm=dm,
+        chan_freqs=1500.0 + foff * np.arange(nchans),
+        your_header=types.SimpleNamespace(tsamp=8.192e-5),
+    )
+    dms = np.linspace(0, 2 * dm, 256)
+    host = (dmt_delays(cand, dms) % nsamples).astype(np.int32)
+    device = gpu.device_dmt_delays(cand, dms, nsamples).get()
+    np.testing.assert_array_equal(device, host)
+
+
+_COUNT_COMPILES = """
+import numpy as np
+from cupy.cuda import compiler
+from your.utils import gpu
+
+compiles = []
+real = compiler.compile_using_nvrtc
+compiler.compile_using_nvrtc = lambda *a, **k: compiles.append(1) or real(*a, **k)
+for acc in (np.int32, np.int64):
+    for name in gpu._KERNELS:
+        gpu._kernel(name, np.uint8, acc)
+gpu._transpose_u8()
+print(len(compiles))
+"""
+
+
+@pytest.mark.skipif(not gpu.available(), reason="requires a GPU")
+def test_kernels_come_from_the_disk_cache(tmp_path):
+    import subprocess
+
+    def compiles():
+        result = subprocess.run(
+            [sys.executable, "-c", _COUNT_COMPILES],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CUPY_CACHE_DIR": str(tmp_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        return int(result.stdout.strip())
+
+    assert compiles() == 2
+    assert compiles() == 0
+
+
 def test_check_devices(monkeypatch):
     def run(stdout, stderr=""):
         result = types.SimpleNamespace(stdout=stdout, stderr=stderr)

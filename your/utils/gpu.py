@@ -163,7 +163,9 @@ def gpu_errors():
 # one thread per output cell throughout, each summing in a register. Sizes
 # and offsets are 64-bit, as numba's were, so a chunk may pass 2**31 bytes.
 # Modulo of a possibly negative value wraps as Python's does, which these
-# kernels relied on under numba.
+# kernels relied on under numba. T is the data type and A the accumulator,
+# typedefs that `_module` puts in front: kernels for each pair are a module of
+# their own, with plain C names.
 _SOURCE = r"""
 typedef long long i64;
 
@@ -197,8 +199,7 @@ extern "C" __global__ void transpose_u8(
 // `fdf` channels by `tdf` samples per kept output cell. `delays` are wrapped
 // into [0, nsamples); `col0` is the first decimated column kept, wrapping
 // when negative.
-template <typename T, typename A>
-__global__ void dedisp_window(
+extern "C" __global__ void dedisp_window(
     const T* data, i64 nchans, i64 nsamples, const int* delays, i64 fdf,
     i64 tdf, i64 col0, float* out, i64 rows, i64 width)
 {
@@ -223,8 +224,7 @@ __global__ void dedisp_window(
 // samples per kept (DM, column) cell. Threads of a warp share a column across
 // neighbouring DMs, whose delays barely differ, so their reads land on the
 // same few cache lines. `delays` is (nchans, ndm).
-template <typename T, typename A>
-__global__ void dmt_window(
+extern "C" __global__ void dmt_window(
     const T* data, i64 nchans, i64 nsamples, const int* delays, i64 ndm,
     i64 tdf, i64 col0, float* out, i64 width)
 {
@@ -250,8 +250,8 @@ __global__ void dmt_window(
 // Sum of each channel over each block of BLOCK samples, written one column
 // right so `block_prefix` can turn each row into exclusive prefix sums.
 // `csum` is (nchans, nblocks + 1).
-template <typename T, typename A>
-__global__ void block_sums(const T* data, i64 nchans, i64 nsamples, A* csum, i64 stride)
+extern "C" __global__ void block_sums(
+    const T* data, i64 nchans, i64 nsamples, A* csum, i64 stride)
 {
     const i64 b = (i64)blockIdx.x * blockDim.x + threadIdx.x;
     const i64 ch = (i64)blockIdx.y * blockDim.y + threadIdx.y;
@@ -264,8 +264,7 @@ __global__ void block_sums(const T* data, i64 nchans, i64 nsamples, A* csum, i64
 
 // Running sum along each channel's blocks, so `csum[ch, b]` is the sum of the
 // channel's first `b * BLOCK` samples.
-template <typename A>
-__global__ void block_prefix(A* csum, i64 nchans, i64 stride)
+extern "C" __global__ void block_prefix(A* csum, i64 nchans, i64 stride)
 {
     const i64 ch = (i64)blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= nchans) return;
@@ -310,11 +309,10 @@ __device__ __forceinline__ i64 wrapped_span_sum(
 }
 
 // `dedisp_window`, adding each channel's `tdf` samples through the block
-// prefix sums `csum` of type C: the same integer sums in about 2 * BLOCK
+// prefix sums `csum` of type A: the same integer sums in about 2 * BLOCK
 // reads, not `tdf`. Integer data only, summed in int64.
-template <typename T, typename C>
-__global__ void dedisp_window_blocks(
-    const T* data, const C* csum, i64 stride, i64 nchans, i64 nsamples,
+extern "C" __global__ void dedisp_window_blocks(
+    const T* data, const A* csum, i64 stride, i64 nchans, i64 nsamples,
     const int* delays, i64 fdf, i64 tdf, i64 col0, float* out, i64 rows, i64 width)
 {
     const i64 col = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -331,11 +329,10 @@ __global__ void dedisp_window_blocks(
 }
 
 // `dmt_window`, adding each channel's `tdf` samples through the block prefix
-// sums `csum` of type C: the same integer sums in about 2 * BLOCK reads, not
+// sums `csum` of type A: the same integer sums in about 2 * BLOCK reads, not
 // `tdf`. Integer data only, summed in int64.
-template <typename T, typename C>
-__global__ void dmt_window_blocks(
-    const T* data, const C* csum, i64 stride, i64 nchans, i64 nsamples,
+extern "C" __global__ void dmt_window_blocks(
+    const T* data, const A* csum, i64 stride, i64 nchans, i64 nsamples,
     const int* delays, i64 ndm, i64 tdf, i64 col0, float* out, i64 width)
 {
     const i64 kk = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -353,8 +350,7 @@ __global__ void dmt_window_blocks(
 
 // Each channel of a (nchans, nsamples) chunk rolled back by its delay,
 // wrapped into [0, nsamples): `out[ch, s] = data[ch, (s + delay) % nsamples]`.
-template <typename T>
-__global__ void roll_channels(
+extern "C" __global__ void roll_channels(
     const T* data, i64 nchans, i64 nsamples, const i64* delays, T* out)
 {
     const i64 s = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -367,8 +363,7 @@ __global__ void roll_channels(
 
 // One thread per (DM, sample) of the full DM-time plane, summing the channels
 // in a register. `delays` is (ndm, nchans) and may be negative.
-template <typename T, typename A>
-__global__ void dmt_channels(
+extern "C" __global__ void dmt_channels(
     const T* data, i64 nchans, i64 nsamples, const int* delays, i64 ndm, float* out)
 {
     const i64 jj = (i64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -383,8 +378,8 @@ __global__ void dmt_channels(
 
 // Cumulative sum down the channel axis, one thread per sample, with a leading
 // zero row already in place, so any span of channels sums as one subtraction.
-template <typename T, typename A>
-__global__ void band_cumsum(const T* data, i64 nchans, i64 nsamples, A* cumsum)
+extern "C" __global__ void band_cumsum(
+    const T* data, i64 nchans, i64 nsamples, A* cumsum)
 {
     const i64 jj = (i64)blockIdx.x * blockDim.x + threadIdx.x;
     if (jj >= nsamples) return;
@@ -397,8 +392,7 @@ __global__ void band_cumsum(const T* data, i64 nchans, i64 nsamples, A* cumsum)
 
 // As `dmt_channels`, but each span of channels sharing a delay bin is one
 // subtraction of the band cumulative sum. The span tables are (ndm, width).
-template <typename A>
-__global__ void dmt_runs(
+extern "C" __global__ void dmt_runs(
     const A* cumsum, i64 nsamples, const int* starts, const int* stops,
     const int* delays, const int* nruns, i64 width, i64 ndm, float* out)
 {
@@ -412,6 +406,22 @@ __global__ void dmt_runs(
              - cumsum[(i64)starts[kk * width + rr] * nsamples + idx];
     }
     out[kk * nsamples + jj] = (float)acc;
+}
+
+// `dmt_delays` wrapped into [0, nsamples), from its two factors: `scale` is
+// -4148808 * DM per DM and `inv` is 1 / f0**2 - 1 / f**2 per channel. The same
+// float64 operations in the same order, rounded half to even, so the table
+// matches the host's exactly. `out` is (nchans, ndm).
+extern "C" __global__ void dmt_delay_table(
+    const double* scale, const double* inv, double tsamp, i64 nchans, i64 ndm,
+    i64 nsamples, int* out)
+{
+    const i64 kk = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 ch = (i64)blockIdx.y * blockDim.y + threadIdx.y;
+    if (kk >= ndm || ch >= nchans) return;
+    double shift = __dmul_rn(scale[kk], inv[ch]);
+    shift = __ddiv_rn(__ddiv_rn(shift, 1000.0), tsamp);
+    out[ch * ndm + kk] = (int)pymod((i64)rint(shift), nsamples);
 }
 """
 
@@ -427,18 +437,18 @@ _C_TYPES = {
     np.dtype(np.float64): "double",
 }
 
-# the templates each (data, accumulator) pair is compiled for
-_TEMPLATES = (
-    "dedisp_window<{t}, {a}>",
-    "dmt_window<{t}, {a}>",
-    "block_sums<{t}, {a}>",
-    "block_prefix<{a}>",
-    "dedisp_window_blocks<{t}, {a}>",
-    "dmt_window_blocks<{t}, {a}>",
-    "roll_channels<{t}>",
-    "dmt_channels<{t}, {a}>",
-    "band_cumsum<{t}, {a}>",
-    "dmt_runs<{a}>",
+# the kernels each (data, accumulator) pair is compiled for
+_KERNELS = (
+    "dedisp_window",
+    "dmt_window",
+    "block_sums",
+    "block_prefix",
+    "dedisp_window_blocks",
+    "dmt_window_blocks",
+    "roll_channels",
+    "dmt_channels",
+    "band_cumsum",
+    "dmt_runs",
 )
 
 
@@ -454,40 +464,41 @@ def _module(data_dtype, acc_dtype):
     """
     The kernels for one pair of data and accumulator dtypes. CuPy compiles
     them on first use and keeps the binary in its on-disk cache, so later
-    processes load it instead of compiling.
+    processes load it instead of compiling. That is why the kernels have C
+    names rather than being templates: CuPy recompiles any module built with
+    `name_expressions`, to learn the mangled names, so every candmaker worker
+    spent seconds in NVRTC.
     """
     t, a = _c_type(data_dtype), _c_type(acc_dtype)
-    names = tuple(name.format(t=t, a=a) for name in _TEMPLATES)
-    module = _cupy().RawModule(
-        code=_SOURCE, options=("-std=c++14",), name_expressions=names
+    return _cupy().RawModule(
+        code=f"typedef {t} T;\ntypedef {a} A;\n" + _SOURCE, options=("-std=c++14",)
     )
-    return module, t, a
 
 
 def _kernel(name, data_dtype, acc_dtype=np.int64):
     """
-    A templated kernel, as `name` instantiated for these dtypes.
+    A kernel, compiled for these dtypes.
 
     Args:
-        name (str): one of the templates in `_TEMPLATES`, without arguments
+        name (str): one of `_KERNELS`
         data_dtype: dtype of the data it reads
         acc_dtype: dtype it sums in
 
     Returns:
         cupy.RawKernel: the kernel
     """
-    module, t, a = _module(np.dtype(data_dtype), np.dtype(acc_dtype))
-    template = next(x for x in _TEMPLATES if x.startswith(name + "<"))
-    return module.get_function(template.format(t=t, a=a))
+    if name not in _KERNELS:
+        raise ValueError(f"no GPU kernel {name}")
+    return _module(np.dtype(data_dtype), np.dtype(acc_dtype)).get_function(name)
 
 
-@functools.lru_cache(maxsize=1)
+def _plain_module():
+    """The module holding the kernels that don't depend on the dtypes."""
+    return _module(np.dtype(np.uint8), np.dtype(np.int64))
+
+
 def _transpose_u8():
-    return (
-        _cupy()
-        .RawModule(code=_SOURCE, options=("-std=c++14",))
-        .get_function("transpose_u8")
-    )
+    return _plain_module().get_function("transpose_u8")
 
 
 def _i64(*values):
@@ -811,15 +822,47 @@ def dmt_delays(cand, dms):
     Returns:
         numpy.ndarray: (nchans, ndm) int64 shift in samples, unwrapped
     """
-    freqs = np.asarray(cand.chan_freqs)
+    scale, inv = _dmt_delay_factors(cand, dms)
     return np.round(
-        -1
-        * 4148808.0
-        * dms[None, :]
-        * (1 / (freqs[0]) ** 2 - 1 / (freqs[:, None]) ** 2)
-        / 1000
-        / cand.your_header.tsamp
+        scale[None, :] * inv[:, None] / 1000 / cand.your_header.tsamp
     ).astype(np.int64)
+
+
+def _dmt_delay_factors(cand, dms):
+    """The per-DM and per-channel factors of `dmt_delays`, as float64."""
+    freqs = np.asarray(cand.chan_freqs)
+    return -1 * 4148808.0 * dms, 1 / (freqs[0]) ** 2 - 1 / freqs**2
+
+
+def device_dmt_delays(cand, dms, nsamples):
+    """
+    `dmt_delays(cand, dms) % nsamples` as int32, made on the current device.
+    The table is (nchans, ndm), a million entries for 4096 channels, which
+    took the host about 30 ms per candidate to make, wrap and cast.
+
+    Args:
+        cand: Candidate instance
+        dms (numpy.ndarray): DMs, float64
+        nsamples (int): samples in the chunk
+
+    Returns:
+        cupy.ndarray: (nchans, ndm) int32 shift, wrapped into [0, nsamples)
+    """
+    cupy = _cupy()
+    scale, inv = _dmt_delay_factors(cand, np.asarray(dms, dtype=np.float64))
+    out = cupy.empty((inv.size, scale.size), dtype=np.int32)
+    _plain_module().get_function("dmt_delay_table")(
+        (math.ceil(scale.size / 32), math.ceil(inv.size / 8)),
+        (32, 8),
+        (
+            cupy.asarray(scale),
+            cupy.asarray(inv),
+            np.float64(cand.your_header.tsamp),
+            *_i64(inv.size, scale.size, nsamples),
+            out,
+        ),
+    )
+    return out
 
 
 # samples per block of the block prefix sums; BLOCK in the kernels
@@ -895,8 +938,6 @@ def gpu_dedisp_and_dmt_crop(cand, device=0, width=256, block_from=4 * BLOCK):
     # 64-bit modulo
     ft_host = ft_delays(cand.chan_freqs, cand.dm, cand.your_header.tsamp)
     ft_host = (ft_host % nsamples).astype(np.int32)
-    dmt_host = dmt_delays(cand, np.linspace(0, 2 * cand.dm, 256))
-    dmt_host = np.ascontiguousarray(dmt_host % nsamples).astype(np.int32)
     ft_acc = accumulator(data.dtype, fdf * tdf)
     dmt_acc = accumulator(data.dtype, nchans * tdf)
     nblocks = nsamples // BLOCK
@@ -913,7 +954,9 @@ def gpu_dedisp_and_dmt_crop(cand, device=0, width=256, block_from=4 * BLOCK):
                 cand_data_in = cupy.empty((nchans, nsamples), dtype=data.dtype)
                 cand_data_in.set(np.ascontiguousarray(data.T), stream=stream)
             ft_delay_table = cupy.asarray(ft_host)
-            dmt_delay_table = cupy.asarray(dmt_host)
+            dmt_delay_table = device_dmt_delays(
+                cand, np.linspace(0, 2 * cand.dm, 256), nsamples
+            )
             ft_out = cupy.empty((rows, width), dtype=np.float32)
             dmt_out = cupy.empty((256, width), dtype=np.float32)
 
